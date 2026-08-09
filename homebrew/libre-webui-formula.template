@@ -1,0 +1,65 @@
+# Libre WebUI Homebrew Formula
+# Generated from the release template in the main repo.
+#
+# Installation:
+#   brew tap libre-webui/tap
+#   brew install libre-webui
+#
+# Or install directly:
+#   brew install libre-webui/tap/libre-webui
+
+class LibreWebui < Formula
+  desc "Open, self-hosted workspace for creating with AI"
+  homepage "https://librewebui.org/"
+  url "https://registry.npmjs.org/libre-webui/-/libre-webui-{{VERSION}}.tgz"
+  sha256 "{{NPM_SHA256}}"
+  license "Apache-2.0"
+  head "https://github.com/libre-webui/libre-webui.git", branch: "main"
+
+  depends_on "node"
+
+  def install
+    system "npm", "install", *std_npm_args(ignore_scripts: false)
+    bin.install_symlink libexec.glob("bin/*")
+  end
+
+  def caveats
+    <<~EOS
+      Libre WebUI has been installed!
+
+      To start the server:
+        libre-webui
+
+      To start on a custom port:
+        libre-webui --port 3000
+
+      Configuration:
+        Data is stored in: ~/.libre-webui
+        Set DATA_DIR to use another location.
+
+      Optional: Connect to Ollama for local LLM support:
+        brew install ollama
+        ollama serve
+
+      For API providers, set environment variables:
+        export OLLAMA_BASE_URL=http://localhost:11434
+        export OPENAI_API_KEY=your-key
+        export ANTHROPIC_API_KEY=your-key
+
+      Documentation: https://docs.librewebui.org
+    EOS
+  end
+
+  service do
+    run [opt_bin/"libre-webui"]
+    keep_alive true
+    working_dir var/"libre-webui"
+    log_path var/"log/libre-webui.log"
+    error_log_path var/"log/libre-webui.log"
+    environment_variables PATH: std_service_path_env
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/libre-webui --version")
+  end
+end

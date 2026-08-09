@@ -1,0 +1,26 @@
+apiVersion: v2
+name: libre-webui
+description: A local-first workspace for chat, private knowledge, artifacts, and isolated model-driven work
+type: application
+version: 0.21.1
+appVersion: "0.21.1"
+keywords:
+  - ai
+  - chat
+  - ollama
+  - llm
+  - openai
+  - anthropic
+  - self-hosted
+  - local-ai
+  - rag
+  - agents
+  - artifacts
+  - open-source
+home: https://librewebui.org
+sources:
+  - https://github.com/libre-webui/libre-webui
+maintainers:
+  - name: Kroonen AI
+    email: enterprise@kroonen.ai
+    url: https://kroonen.ai

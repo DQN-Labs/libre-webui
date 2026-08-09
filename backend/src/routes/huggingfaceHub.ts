@@ -1,0 +1,564 @@
+/*
+ * Libre WebUI
+ * Copyright (C) 2025 Kroonen AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import express, { Request, Response } from 'express';
+import rateLimit from 'express-rate-limit';
+import axios from 'axios';
+import { ApiResponse, getErrorMessage } from '../types/index.js';
+import { authenticate, requireAdmin } from '../middleware/auth.js';
+
+const router = express.Router();
+
+// Cache for model lists (24h TTL)
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+}
+
+const modelCache: Map<string, CacheEntry<HuggingFaceModel[]>> = new Map();
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// HuggingFace API types
+interface HuggingFaceModel {
+  id: string;
+  modelId: string;
+  author: string;
+  sha: string;
+  lastModified: string;
+  private: boolean;
+  disabled: boolean;
+  gated: boolean | string;
+  downloads: number;
+  likes: number;
+  tags: string[];
+  pipeline_tag?: string;
+  library_name?: string;
+  createdAt: string;
+}
+
+interface HuggingFaceModelResponse {
+  id: string;
+  modelId: string;
+  author: string;
+  downloads: number;
+  likes: number;
+  tags: string[];
+  pipeline_tag?: string;
+  library_name?: string;
+  gated: boolean | string;
+  hasGguf?: boolean;
+}
+
+// GGUF file info from HuggingFace
+interface GgufFileInfo {
+  filename: string;
+  size: number;
+  sizeFormatted: string;
+  quantization?: string;
+  url: string;
+  ollamaCommand: string;
+}
+
+// HuggingFace file tree response
+interface HfFileInfo {
+  type: 'file' | 'directory';
+  path: string;
+  size?: number;
+  oid?: string;
+  lfs?: {
+    size: number;
+    sha256: string;
+    pointerSize: number;
+  };
+}
+
+// Validate and sanitize HuggingFace model ID components to prevent SSRF
+// Valid characters: alphanumeric, hyphens, underscores, dots
+const VALID_HF_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
+
+function sanitizeHfId(id: unknown, fieldName: string): string {
+  if (!id || typeof id !== 'string') {
+    throw new Error(`Invalid ${fieldName}: must be a non-empty string`);
+  }
+  if (id.length > 100) {
+    throw new Error(`Invalid ${fieldName}: too long (max 100 characters)`);
+  }
+  if (!VALID_HF_ID_PATTERN.test(id)) {
+    throw new Error(
+      `Invalid ${fieldName}: contains invalid characters. Only alphanumeric, hyphens, underscores, and dots are allowed.`
+    );
+  }
+  // Prevent path traversal
+  if (id.includes('..') || id.startsWith('.') || id.endsWith('.')) {
+    throw new Error(`Invalid ${fieldName}: invalid format`);
+  }
+  // Return the validated string - this creates a clear data flow for static analysis
+  return id;
+}
+
+// Rate limiting for Hub API requests
+const hubRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 200, // Limit each IP to 200 requests per window
+  message: {
+    success: false,
+    error: 'Too many HuggingFace Hub requests, please try again later.',
+  },
+});
+
+router.use(hubRateLimit);
+router.use(authenticate);
+
+/**
+ * Get models from HuggingFace Hub API
+ * Supports filtering by task, author, search query, and sorting
+ */
+router.get(
+  '/models',
+  async (
+    req: Request,
+    res: Response<ApiResponse<HuggingFaceModelResponse[]>>
+  ): Promise<void> => {
+    try {
+      const {
+        task = 'text-generation',
+        search = '',
+        author = '',
+        sort = 'downloads',
+        direction = 'desc',
+        limit = '50',
+        inference = 'true', // Only show models available for inference
+      } = req.query;
+
+      // Build cache key
+      const cacheKey = JSON.stringify({
+        task,
+        search,
+        author,
+        sort,
+        direction,
+        limit,
+        inference,
+      });
+
+      // Check cache
+      const cached = modelCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        res.json({
+          success: true,
+          data: cached.data.map(formatModelResponse),
+        });
+        return;
+      }
+
+      // Build HuggingFace API URL
+      const params = new URLSearchParams();
+
+      if (task) params.append('pipeline_tag', task as string);
+      if (search) params.append('search', search as string);
+      if (author) params.append('author', author as string);
+      if (sort) params.append('sort', sort as string);
+      if (direction === 'asc') params.append('direction', '-1');
+      if (limit) params.append('limit', limit as string);
+      // Note: 'inference' parameter removed - HuggingFace API changed
+
+      const url = `https://huggingface.co/api/models?${params.toString()}`;
+
+      const response = await axios.get<HuggingFaceModel[]>(url, {
+        timeout: 10000,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      // Cache the response
+      modelCache.set(cacheKey, {
+        data: response.data,
+        timestamp: Date.now(),
+      });
+
+      res.json({
+        success: true,
+        data: response.data.map(formatModelResponse),
+      });
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status || 500;
+        res.status(status).json({
+          success: false,
+          error: `HuggingFace API error: ${error.message}`,
+        });
+      } else {
+        res.status(500).json({
+          success: false,
+          error: getErrorMessage(error, 'Failed to fetch models'),
+        });
+      }
+    }
+  }
+);
+
+/**
+ * Get a specific model's details
+ */
+router.get(
+  '/models/:author/:modelName',
+  async (
+    req: Request,
+    res: Response<ApiResponse<HuggingFaceModel>>
+  ): Promise<void> => {
+    try {
+      // Sanitize inputs to prevent SSRF - only use sanitized values for URL
+      const author = sanitizeHfId(req.params.author, 'author');
+      const modelName = sanitizeHfId(req.params.modelName, 'modelName');
+
+      const modelId = `${author}/${modelName}`;
+      const url = `https://huggingface.co/api/models/${modelId}`;
+
+      const response = await axios.get<HuggingFaceModel>(url, {
+        timeout: 10000,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      res.json({
+        success: true,
+        data: response.data,
+      });
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status || 500;
+        res.status(status).json({
+          success: false,
+          error:
+            status === 404
+              ? 'Model not found'
+              : `HuggingFace API error: ${error.message}`,
+        });
+      } else {
+        res.status(500).json({
+          success: false,
+          error: getErrorMessage(error, 'Failed to fetch model'),
+        });
+      }
+    }
+  }
+);
+
+/**
+ * Get available tasks (pipeline tags) from HuggingFace
+ */
+router.get(
+  '/tasks',
+  async (req: Request, res: Response<ApiResponse<string[]>>): Promise<void> => {
+    // Common tasks for chat/inference
+    const tasks = [
+      'text-generation',
+      'text2text-generation',
+      'text-to-speech',
+      'automatic-speech-recognition',
+      'text-to-image',
+      'image-to-text',
+      'feature-extraction',
+      'fill-mask',
+      'question-answering',
+      'summarization',
+      'translation',
+      'zero-shot-classification',
+    ];
+
+    res.json({
+      success: true,
+      data: tasks,
+    });
+  }
+);
+
+/**
+ * Clear the model cache (admin endpoint)
+ */
+router.post(
+  '/cache/clear',
+  requireAdmin,
+  async (req: Request, res: Response<ApiResponse<boolean>>): Promise<void> => {
+    modelCache.clear();
+    res.json({
+      success: true,
+      data: true,
+    });
+  }
+);
+
+/**
+ * Get trending models for quick access
+ */
+router.get(
+  '/trending',
+  async (
+    req: Request,
+    res: Response<ApiResponse<HuggingFaceModelResponse[]>>
+  ): Promise<void> => {
+    try {
+      const { task = 'text-generation', limit = '20' } = req.query;
+
+      const cacheKey = `trending_${task}_${limit}`;
+
+      // Check cache
+      const cached = modelCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        res.json({
+          success: true,
+          data: cached.data.map(formatModelResponse),
+        });
+        return;
+      }
+
+      const params = new URLSearchParams();
+      params.append('pipeline_tag', task as string);
+      params.append('sort', 'downloads'); // Use downloads as proxy for popularity
+      params.append('limit', limit as string);
+
+      const url = `https://huggingface.co/api/models?${params.toString()}`;
+
+      const response = await axios.get<HuggingFaceModel[]>(url, {
+        timeout: 10000,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      // Cache the response
+      modelCache.set(cacheKey, {
+        data: response.data,
+        timestamp: Date.now(),
+      });
+
+      res.json({
+        success: true,
+        data: response.data.map(formatModelResponse),
+      });
+    } catch (error: unknown) {
+      res.status(500).json({
+        success: false,
+        error: getErrorMessage(error, 'Failed to fetch trending models'),
+      });
+    }
+  }
+);
+
+/**
+ * Get GGUF files available for a model
+ * Returns list of GGUF files with size, quantization info, and Ollama pull command
+ */
+router.get(
+  '/models/:author/:modelName/gguf',
+  async (
+    req: Request,
+    res: Response<ApiResponse<GgufFileInfo[]>>
+  ): Promise<void> => {
+    try {
+      // Sanitize inputs to prevent SSRF - only use sanitized values for URL
+      const author = sanitizeHfId(req.params.author, 'author');
+      const modelName = sanitizeHfId(req.params.modelName, 'modelName');
+
+      const modelId = `${author}/${modelName}`;
+
+      // Get the file tree from HuggingFace
+      const url = `https://huggingface.co/api/models/${modelId}/tree/main`;
+
+      const response = await axios.get<HfFileInfo[]>(url, {
+        timeout: 15000,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      // Filter for GGUF files
+      const ggufFiles: GgufFileInfo[] = response.data
+        .filter(
+          (file): file is HfFileInfo & { size: number } =>
+            file.type === 'file' &&
+            file.path.toLowerCase().endsWith('.gguf') &&
+            file.size !== undefined
+        )
+        .map(file => {
+          // Extract quantization from filename (e.g., Q4_K_M, Q8_0, etc.)
+          const quantMatch = file.path.match(
+            /[_.-](Q\d+_?[A-Z0-9_]*|F16|F32|BF16)/i
+          );
+          const quantization = quantMatch
+            ? quantMatch[1].toUpperCase()
+            : undefined;
+
+          // Use LFS size if available, otherwise regular size
+          const size = file.lfs?.size || file.size;
+
+          // Ollama HF pull format: hf.co/{author}/{repo}:{tag}
+          // Tag should match the filename pattern (without .gguf extension)
+          // e.g., "Qwen3-0.6B-Q2_K.gguf" -> tag is "Qwen3-0.6B-Q2_K" or just "Q2_K"
+          const filenameWithoutExt = file.path.replace(/\.gguf$/i, '');
+
+          return {
+            filename: file.path,
+            size,
+            sizeFormatted: formatFileSize(size),
+            quantization,
+            url: `https://huggingface.co/${modelId}/resolve/main/${file.path}`,
+            // Use the quantization as tag if available, otherwise use full filename
+            ollamaCommand: quantization
+              ? `hf.co/${modelId}:${quantization}`
+              : `hf.co/${modelId}:${filenameWithoutExt}`,
+          };
+        })
+        .sort((a, b) => {
+          // Sort by quantization quality (higher bits first)
+          const getQuantOrder = (q?: string): number => {
+            if (!q) return 0;
+            if (q.includes('F32')) return 100;
+            if (q.includes('F16') || q.includes('BF16')) return 90;
+            if (q.includes('Q8')) return 80;
+            if (q.includes('Q6')) return 70;
+            if (q.includes('Q5')) return 60;
+            if (q.includes('Q4')) return 50;
+            if (q.includes('Q3')) return 40;
+            if (q.includes('Q2')) return 30;
+            return 10;
+          };
+          return getQuantOrder(b.quantization) - getQuantOrder(a.quantization);
+        });
+
+      res.json({
+        success: true,
+        data: ggufFiles,
+      });
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status || 500;
+        res.status(status).json({
+          success: false,
+          error:
+            status === 404
+              ? 'Model not found or no files available'
+              : `HuggingFace API error: ${error.message}`,
+        });
+      } else {
+        res.status(500).json({
+          success: false,
+          error: getErrorMessage(error, 'Failed to fetch GGUF files'),
+        });
+      }
+    }
+  }
+);
+
+/**
+ * Check if a model has GGUF files available
+ * Quick check without fetching full file list
+ */
+router.get(
+  '/models/:author/:modelName/has-gguf',
+  async (
+    req: Request,
+    res: Response<ApiResponse<{ hasGguf: boolean; count: number }>>
+  ): Promise<void> => {
+    try {
+      // Sanitize inputs to prevent SSRF - only use sanitized values for URL
+      const author = sanitizeHfId(req.params.author, 'author');
+      const modelName = sanitizeHfId(req.params.modelName, 'modelName');
+
+      const modelId = `${author}/${modelName}`;
+
+      // Check cache first
+      const cacheKey = `gguf_check_${modelId}`;
+      const cached = modelCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        const ggufCount = (cached.data as unknown as { count: number }).count;
+        res.json({
+          success: true,
+          data: { hasGguf: ggufCount > 0, count: ggufCount },
+        });
+        return;
+      }
+
+      // Get the file tree from HuggingFace
+      const url = `https://huggingface.co/api/models/${modelId}/tree/main`;
+
+      const response = await axios.get<HfFileInfo[]>(url, {
+        timeout: 10000,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      // Count GGUF files
+      const ggufCount = response.data.filter(
+        file =>
+          file.type === 'file' && file.path.toLowerCase().endsWith('.gguf')
+      ).length;
+
+      // Cache the result
+      modelCache.set(cacheKey, {
+        data: [{ count: ggufCount }] as unknown as HuggingFaceModel[],
+        timestamp: Date.now(),
+      });
+
+      res.json({
+        success: true,
+        data: { hasGguf: ggufCount > 0, count: ggufCount },
+      });
+    } catch (_error: unknown) {
+      // If we can't check, assume no GGUF files
+      res.json({
+        success: true,
+        data: { hasGguf: false, count: 0 },
+      });
+    }
+  }
+);
+
+/**
+ * Format file size to human readable string
+ */
+function formatFileSize(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+/**
+ * Format model response to include only necessary fields
+ */
+function formatModelResponse(
+  model: HuggingFaceModel
+): HuggingFaceModelResponse {
+  return {
+    id: model.id || model.modelId,
+    modelId: model.modelId || model.id,
+    author: model.author || model.id?.split('/')[0] || 'unknown',
+    downloads: model.downloads || 0,
+    likes: model.likes || 0,
+    tags: model.tags || [],
+    pipeline_tag: model.pipeline_tag,
+    library_name: model.library_name,
+    gated: model.gated || false,
+  };
+}
+
+export default router;

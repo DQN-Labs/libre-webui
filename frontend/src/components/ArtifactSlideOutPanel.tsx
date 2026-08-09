@@ -1,0 +1,740 @@
+/*
+ * Libre WebUI
+ * Copyright (C) 2025 Kroonen AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { createPortal } from 'react-dom';
+import {
+  Code,
+  FileText,
+  Globe,
+  X,
+  Copy,
+  Check,
+  AlertTriangle,
+  Download,
+  ExternalLink,
+  Eye,
+  Code2,
+  GripVertical,
+  ChevronLeft,
+  ChevronRight,
+} from 'lucide-react';
+import { Button } from '@/components/ui/Button';
+import { OptimizedSyntaxHighlighter } from '@/components/OptimizedSyntaxHighlighter';
+import { ArtifactSandboxFrame } from '@/components/ArtifactSandboxFrame';
+import { useAppStore } from '@/store/appStore';
+import { useChatStore } from '@/store/chatStore';
+import {
+  buildHtmlArtifactDocument,
+  buildSvgArtifactDocument,
+  openArtifactPreviewWindow,
+  SVG_ARTIFACT_SANDBOX,
+} from '@/utils/artifactHtml';
+import { ARTIFACT_SANDBOX_URL } from '@/utils/artifactSandbox';
+import {
+  artifactSandboxKind,
+  buildArtifactSandboxDocument,
+  type ArtifactSandboxKind,
+} from '@/utils/artifactRuntimeDocument';
+import { cn } from '@/utils';
+import { createLogger } from '@/utils/logger';
+import { isRTL } from '@/i18n';
+
+const logger = createLogger('components:artifact-slide-out-panel');
+
+// Min/max panel widths
+const MIN_PANEL_WIDTH = 320;
+const MAX_PANEL_WIDTH_RATIO = 0.9; // 90% of screen width
+const DEFAULT_PANEL_WIDTH = 600;
+
+export const ArtifactSlideOutPanel: React.FC = () => {
+  const { t, i18n } = useTranslation();
+  const rtl = isRTL(i18n.language);
+  const {
+    artifactPanelOpen,
+    artifactPanelArtifact,
+    openArtifactPanel,
+    closeArtifactPanel,
+    theme,
+  } = useAppStore();
+  const currentSession = useChatStore(state => state.currentSession);
+
+  // Artifacts sharing a title across the conversation are iterations of the
+  // same piece of work; expose them as versions of one another.
+  const versions = React.useMemo(() => {
+    if (!artifactPanelArtifact) return [];
+    const key = artifactPanelArtifact.title.trim().toLowerCase();
+    const matches = (currentSession?.messages ?? [])
+      .flatMap(message => message.artifacts ?? [])
+      .filter(candidate => candidate.title.trim().toLowerCase() === key);
+    if (!matches.some(candidate => candidate.id === artifactPanelArtifact.id)) {
+      // Ad-hoc previews (e.g. from a code block) are not part of any message.
+      return [...matches, artifactPanelArtifact];
+    }
+    return matches;
+  }, [currentSession, artifactPanelArtifact]);
+  const versionIndex = versions.findIndex(
+    candidate => candidate.id === artifactPanelArtifact?.id
+  );
+  const [copied, setCopied] = useState(false);
+  const [viewMode, setViewMode] = useState<'preview' | 'code'>('preview');
+  const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH);
+  const [isResizing, setIsResizing] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const prevArtifactIdRef = useRef<string | null>(null);
+  const resizeStartXRef = useRef(0);
+  const resizeStartWidthRef = useRef(0);
+  const resizePointerIdRef = useRef<number | null>(null);
+  const resizeFrameRef = useRef<number | null>(null);
+  const pendingWidthRef = useRef(panelWidth);
+
+  // Reset view mode when artifact changes (using ref pattern to avoid effect setState)
+  const currentArtifactId = artifactPanelArtifact?.id ?? null;
+  if (currentArtifactId !== prevArtifactIdRef.current) {
+    prevArtifactIdRef.current = currentArtifactId;
+    if (viewMode !== 'preview') {
+      setViewMode('preview');
+    }
+  }
+
+  const schedulePanelWidth = useCallback((width: number) => {
+    pendingWidthRef.current = width;
+
+    if (resizeFrameRef.current !== null) {
+      return;
+    }
+
+    resizeFrameRef.current = window.requestAnimationFrame(() => {
+      resizeFrameRef.current = null;
+      setPanelWidth(pendingWidthRef.current);
+    });
+  }, []);
+
+  const handleResizeEnd = useCallback(() => {
+    resizePointerIdRef.current = null;
+    setIsResizing(false);
+
+    if (resizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(resizeFrameRef.current);
+      resizeFrameRef.current = null;
+      setPanelWidth(pendingWidthRef.current);
+    }
+  }, []);
+
+  // Handle resize
+  const handleResizeStart = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      resizePointerIdRef.current = e.pointerId;
+      resizeStartWidthRef.current = panelWidth;
+      resizeStartXRef.current = e.clientX;
+      pendingWidthRef.current = panelWidth;
+      e.currentTarget.setPointerCapture(e.pointerId);
+      setIsResizing(true);
+    },
+    [panelWidth]
+  );
+
+  const handleResizeMove = useCallback(
+    (e: PointerEvent) => {
+      if (!isResizing) return;
+      if (
+        resizePointerIdRef.current !== null &&
+        e.pointerId !== resizePointerIdRef.current
+      ) {
+        return;
+      }
+
+      e.preventDefault();
+      const deltaX = (resizeStartXRef.current - e.clientX) * (rtl ? -1 : 1);
+      const maxWidth = window.innerWidth * MAX_PANEL_WIDTH_RATIO;
+      const newWidth = Math.min(
+        maxWidth,
+        Math.max(MIN_PANEL_WIDTH, resizeStartWidthRef.current + deltaX)
+      );
+      schedulePanelWidth(newWidth);
+    },
+    [isResizing, rtl, schedulePanelWidth]
+  );
+
+  // Resize event listeners
+  useEffect(() => {
+    if (!isResizing) {
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      return undefined;
+    }
+
+    const handlePointerEnd = (e: PointerEvent) => {
+      if (
+        resizePointerIdRef.current === null ||
+        e.pointerId === resizePointerIdRef.current
+      ) {
+        handleResizeEnd();
+      }
+    };
+
+    window.addEventListener('pointermove', handleResizeMove, {
+      passive: false,
+    });
+    window.addEventListener('pointerup', handlePointerEnd);
+    window.addEventListener('pointercancel', handlePointerEnd);
+    window.addEventListener('blur', handleResizeEnd);
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+
+    return () => {
+      window.removeEventListener('pointermove', handleResizeMove);
+      window.removeEventListener('pointerup', handlePointerEnd);
+      window.removeEventListener('pointercancel', handlePointerEnd);
+      window.removeEventListener('blur', handleResizeEnd);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+  }, [isResizing, handleResizeMove, handleResizeEnd]);
+
+  // Handle window resize to ensure panel doesn't exceed max width
+  useEffect(() => {
+    const handleWindowResize = () => {
+      const maxWidth = window.innerWidth * MAX_PANEL_WIDTH_RATIO;
+      if (panelWidth > maxWidth) {
+        setPanelWidth(maxWidth);
+      }
+    };
+
+    window.addEventListener('resize', handleWindowResize);
+    return () => window.removeEventListener('resize', handleWindowResize);
+  }, [panelWidth]);
+
+  // Handle escape key to close panel
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && artifactPanelOpen) {
+        closeArtifactPanel();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [artifactPanelOpen, closeArtifactPanel]);
+
+  // Handle click outside to close panel (but not on resize handle)
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (isResizing) return; // Don't close while resizing
+
+      if (
+        panelRef.current &&
+        !panelRef.current.contains(e.target as Node) &&
+        artifactPanelOpen
+      ) {
+        closeArtifactPanel();
+      }
+    };
+    // Add small delay to avoid closing immediately on open
+    const timer = setTimeout(() => {
+      window.addEventListener('mousedown', handleClickOutside);
+    }, 100);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [artifactPanelOpen, closeArtifactPanel, isResizing]);
+
+  if (!artifactPanelArtifact) return null;
+
+  const artifact = artifactPanelArtifact;
+
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (_err) {
+      logger.error('Failed to copy:', _err);
+    }
+  };
+
+  const downloadArtifact = () => {
+    const content =
+      artifact.type === 'html'
+        ? buildHtmlArtifactDocument(artifact.content, artifact.title)
+        : artifact.content;
+    const blob = new Blob([content], {
+      type: getContentType(artifact.type),
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${artifact.title}.${getFileExtension(artifact.type)}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const getContentType = (type: string) => {
+    switch (type) {
+      case 'html':
+        return 'text/html';
+      case 'react':
+        return 'text/javascript';
+      case 'svg':
+        return 'image/svg+xml';
+      case 'css':
+        return 'text/css';
+      case 'json':
+        return 'application/json';
+      default:
+        return 'text/plain';
+    }
+  };
+
+  const getFileExtension = (type: string) => {
+    switch (type) {
+      case 'html':
+        return 'html';
+      case 'react':
+        return 'jsx';
+      case 'svg':
+        return 'svg';
+      case 'css':
+        return 'css';
+      case 'json':
+        return 'json';
+      default:
+        return 'txt';
+    }
+  };
+
+  const getIcon = () => {
+    switch (artifact.type) {
+      case 'html':
+        return <Globe className='h-5 w-5' />;
+      case 'react':
+        return <Code className='h-5 w-5' />;
+      case 'svg':
+        return <FileText className='h-5 w-5' />;
+      case 'code':
+        return <Code className='h-5 w-5' />;
+      default:
+        return <FileText className='h-5 w-5' />;
+    }
+  };
+
+  const renderHtmlFallback = () => (
+    <div
+      data-testid='artifact-html-fallback'
+      className='w-full h-full flex items-center justify-center bg-gray-50 dark:bg-dark-100 rounded-lg border border-gray-200 dark:border-dark-200 p-4'
+    >
+      <div className='max-w-sm text-center'>
+        <AlertTriangle className='h-8 w-8 text-primary-500 mx-auto mb-3' />
+        <p className='text-sm font-medium text-gray-900 dark:text-gray-100'>
+          {t('artifacts.previewUnavailable')}
+        </p>
+        <p className='mt-1 text-sm text-gray-600 dark:text-gray-400'>
+          {t('artifacts.previewUnavailableDescription')}
+        </p>
+        <Button
+          variant='outline'
+          size='sm'
+          onClick={() => setViewMode('code')}
+          className='mt-4'
+        >
+          <Code2 className='h-3.5 w-3.5 me-1.5' />
+          {t('artifacts.code')}
+        </Button>
+      </div>
+    </div>
+  );
+
+  // The runtime is inlined into the document, so preparing it is asynchronous.
+  const openArtifactWindow = async () => {
+    try {
+      const document = await buildArtifactSandboxDocument(
+        artifactSandboxKind(artifact.type) ?? 'html',
+        artifact.content,
+        artifact.title,
+        { colorScheme: theme.mode === 'dark' ? 'dark' : 'light' }
+      );
+      openArtifactPreviewWindow(document, ARTIFACT_SANDBOX_URL, artifact.title);
+    } catch (error) {
+      logger.error('Failed to open the artifact preview:', error);
+    }
+  };
+
+  const renderSandbox = (kind: ArtifactSandboxKind) => {
+    if (!artifact.content.trim()) {
+      return renderHtmlFallback();
+    }
+
+    return (
+      <ArtifactSandboxFrame
+        content={artifact.content}
+        title={artifact.title}
+        kind={kind}
+        colorScheme={theme.mode === 'dark' ? 'dark' : 'light'}
+        className={cn(
+          'w-full h-full border-0 rounded-lg bg-white',
+          isResizing && 'pointer-events-none'
+        )}
+        fallback={renderHtmlFallback()}
+      />
+    );
+  };
+
+  const renderSvg = () => {
+    return (
+      <iframe
+        data-testid='artifact-svg-preview'
+        srcDoc={buildSvgArtifactDocument(artifact.content, artifact.title)}
+        className='w-full h-full border-0 rounded-lg bg-white'
+        sandbox={SVG_ARTIFACT_SANDBOX}
+        title={artifact.title}
+      />
+    );
+  };
+
+  const renderCode = () => {
+    const getLanguage = () => {
+      if (artifact.language) {
+        return artifact.language;
+      }
+      switch (artifact.type) {
+        case 'html':
+          return 'html';
+        case 'react':
+          return 'jsx';
+        case 'svg':
+          return 'xml';
+        case 'json':
+          return 'json';
+        default:
+          return 'text';
+      }
+    };
+
+    return (
+      <div className='h-full overflow-auto'>
+        <OptimizedSyntaxHighlighter
+          language={getLanguage()}
+          isDark={theme.mode === 'dark'}
+          className='!m-0 !rounded-lg !h-full'
+        >
+          {artifact.content}
+        </OptimizedSyntaxHighlighter>
+      </div>
+    );
+  };
+
+  const renderJson = () => {
+    try {
+      const parsedJson = JSON.parse(artifact.content);
+      const formattedJson = JSON.stringify(parsedJson, null, 2);
+
+      return (
+        <div className='h-full overflow-auto'>
+          <OptimizedSyntaxHighlighter
+            language='json'
+            isDark={theme.mode === 'dark'}
+            className='!m-0 !rounded-lg !h-full'
+          >
+            {formattedJson}
+          </OptimizedSyntaxHighlighter>
+        </div>
+      );
+    } catch (_err) {
+      return (
+        <div className='w-full h-full flex items-center justify-center bg-gray-50 dark:bg-dark-100 rounded-lg'>
+          <div className='text-center'>
+            <AlertTriangle className='h-8 w-8 text-primary-500 mx-auto mb-2' />
+            <p className='text-sm text-gray-600 dark:text-dark-600'>
+              {t('artifacts.invalidJson')}
+            </p>
+          </div>
+        </div>
+      );
+    }
+  };
+
+  const renderContent = () => {
+    if (viewMode === 'code') {
+      return renderCode();
+    }
+
+    switch (artifact.type) {
+      case 'html':
+        return renderSandbox('html');
+      case 'react':
+        return renderSandbox('react');
+      case 'mermaid':
+        return renderSandbox('mermaid');
+      case 'svg':
+        return renderSvg();
+      case 'json':
+        return renderJson();
+      case 'code':
+      case 'text':
+      default:
+        return renderCode();
+    }
+  };
+
+  const shouldShowViewToggle = () => {
+    return (
+      artifact.type === 'html' ||
+      artifact.type === 'svg' ||
+      artifact.type === 'react' ||
+      artifact.type === 'mermaid'
+    );
+  };
+
+  // On mobile, use full width
+  const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+  const effectiveWidth = isMobile ? '100%' : `${panelWidth}px`;
+
+  const panel = (
+    <>
+      {/* Backdrop */}
+      <div
+        className={cn(
+          'fixed inset-0 bg-black/30 dark:bg-black/50 z-40 transition-opacity duration-300',
+          artifactPanelOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        )}
+      />
+
+      {isResizing && (
+        <div
+          className='fixed inset-0 z-[55] cursor-col-resize select-none'
+          aria-hidden='true'
+        />
+      )}
+
+      {/* Panel */}
+      <div
+        ref={panelRef}
+        data-testid='artifact-slide-out-panel'
+        style={{ width: effectiveWidth }}
+        className={cn(
+          'fixed top-0 end-0 h-full z-50',
+          'bg-white dark:bg-dark-25',
+          'shadow-2xl border-s border-gray-200 dark:border-dark-200',
+          'flex flex-col',
+          'transform transition-transform duration-300 ease-out',
+          artifactPanelOpen
+            ? 'translate-x-0'
+            : 'translate-x-full rtl:-translate-x-full'
+        )}
+      >
+        {/* Resize Handle - only show on non-mobile */}
+        {!isMobile && (
+          <div
+            onPointerDown={handleResizeStart}
+            data-testid='artifact-resize-handle'
+            className={cn(
+              'absolute start-0 top-0 bottom-0 w-4 -ms-2 cursor-col-resize z-[56]',
+              'flex items-center justify-center',
+              'touch-none select-none group'
+            )}
+          >
+            {/* Visual handle */}
+            <div
+              className={cn(
+                'w-1 h-16 rounded-full transition-all duration-200',
+                'bg-gray-300 dark:bg-dark-300',
+                'group-hover:bg-primary-500 group-hover:h-24',
+                isResizing && 'bg-primary-500 h-24'
+              )}
+            />
+            {/* Grip icon on hover */}
+            <div
+              className={cn(
+                'absolute left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity',
+                'text-gray-400 dark:text-dark-500',
+                isResizing && 'opacity-100'
+              )}
+            >
+              <GripVertical className='h-4 w-4' />
+            </div>
+          </div>
+        )}
+
+        {/* Header */}
+        <div className='flex items-center justify-between p-4 border-b border-gray-200 dark:border-dark-200'>
+          <div className='flex items-center gap-3 min-w-0 flex-1'>
+            <div className='text-gray-600 dark:text-gray-400 flex-shrink-0'>
+              {getIcon()}
+            </div>
+            <h2 className='font-semibold text-gray-900 dark:text-gray-100 truncate'>
+              {artifact.title}
+            </h2>
+            <span className='text-xs bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300 px-2 py-1 rounded-full font-medium flex-shrink-0'>
+              {artifact.type.toUpperCase()}
+            </span>
+          </div>
+
+          <Button
+            variant='ghost'
+            size='sm'
+            onClick={closeArtifactPanel}
+            className='h-8 w-8 p-0 hover:bg-gray-100 dark:hover:bg-dark-200 flex-shrink-0'
+            title={t('artifacts.closePanelEsc')}
+          >
+            <X className='h-5 w-5' />
+          </Button>
+        </div>
+
+        {/* Toolbar */}
+        <div className='flex items-center justify-between px-4 py-2 border-b border-gray-100 dark:border-dark-200 bg-gray-50 dark:bg-dark-100/50'>
+          <div className='flex items-center gap-1'>
+            {versions.length > 1 && versionIndex !== -1 && (
+              <div className='me-1 flex items-center gap-0.5'>
+                <Button
+                  variant='ghost'
+                  size='sm'
+                  disabled={versionIndex === 0}
+                  onClick={() => openArtifactPanel(versions[versionIndex - 1])}
+                  className='h-8 w-8 p-0'
+                  title={t('artifacts.previousVersion')}
+                >
+                  <ChevronLeft className='h-3.5 w-3.5 rtl:rotate-180' />
+                </Button>
+                <span className='whitespace-nowrap text-xs tabular-nums text-gray-500 dark:text-dark-600'>
+                  {t('artifacts.versionOf', {
+                    current: versionIndex + 1,
+                    total: versions.length,
+                  })}
+                </span>
+                <Button
+                  variant='ghost'
+                  size='sm'
+                  disabled={versionIndex === versions.length - 1}
+                  onClick={() => openArtifactPanel(versions[versionIndex + 1])}
+                  className='h-8 w-8 p-0'
+                  title={t('artifacts.nextVersion')}
+                >
+                  <ChevronRight className='h-3.5 w-3.5 rtl:rotate-180' />
+                </Button>
+              </div>
+            )}
+            {shouldShowViewToggle() && (
+              <>
+                <Button
+                  variant={viewMode === 'preview' ? 'primary' : 'ghost'}
+                  size='sm'
+                  onClick={() => setViewMode('preview')}
+                  className='h-8 px-3 text-xs'
+                  title={t('artifacts.previewMode')}
+                >
+                  <Eye className='h-3.5 w-3.5 me-1.5' />
+                  {t('artifacts.preview')}
+                </Button>
+                <Button
+                  variant={viewMode === 'code' ? 'primary' : 'ghost'}
+                  size='sm'
+                  onClick={() => setViewMode('code')}
+                  className='h-8 px-3 text-xs'
+                  title={t('artifacts.codeMode')}
+                >
+                  <Code2 className='h-3.5 w-3.5 me-1.5' />
+                  {t('artifacts.code')}
+                </Button>
+              </>
+            )}
+          </div>
+
+          <div className='flex items-center gap-1'>
+            <Button
+              variant='ghost'
+              size='sm'
+              onClick={() => copyToClipboard(artifact.content)}
+              className='h-8 px-3 text-xs hover:bg-gray-100 dark:hover:bg-dark-200'
+              title={t('artifacts.copyContent')}
+            >
+              {copied ? (
+                <>
+                  <Check className='h-3.5 w-3.5 me-1.5 text-green-500' />
+                  {t('artifacts.copied')}
+                </>
+              ) : (
+                <>
+                  <Copy className='h-3.5 w-3.5 me-1.5' />
+                  {t('artifacts.copyButton')}
+                </>
+              )}
+            </Button>
+
+            <Button
+              variant='ghost'
+              size='sm'
+              onClick={downloadArtifact}
+              className='h-8 px-3 text-xs hover:bg-gray-100 dark:hover:bg-dark-200'
+              title={t('artifacts.download')}
+            >
+              <Download className='h-3.5 w-3.5 me-1.5' />
+              {t('artifacts.download')}
+            </Button>
+
+            {artifactSandboxKind(artifact.type) && (
+              <Button
+                variant='ghost'
+                size='sm'
+                onClick={() => openArtifactWindow()}
+                className='h-8 px-3 text-xs hover:bg-gray-100 dark:hover:bg-dark-200'
+                title={t('artifacts.openInNewWindow')}
+              >
+                <ExternalLink className='h-3.5 w-3.5 me-1.5' />
+                {t('artifacts.open')}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {/* Description */}
+        {artifact.description && (
+          <div className='px-4 py-3 border-b border-gray-100 dark:border-dark-200'>
+            <p className='text-sm text-gray-600 dark:text-gray-400'>
+              {artifact.description}
+            </p>
+          </div>
+        )}
+
+        {/* Content */}
+        <div className='flex-1 p-4 overflow-hidden'>{renderContent()}</div>
+
+        {/* Footer */}
+        <div className='px-4 py-2 border-t border-gray-100 dark:border-dark-200 bg-gray-50 dark:bg-dark-100/50'>
+          <div className='flex items-center justify-between'>
+            <div className='text-xs text-gray-500 dark:text-gray-400'>
+              {t('artifacts.created')}:{' '}
+              {new Date(artifact.createdAt).toLocaleString()}
+            </div>
+            {!isMobile && (
+              <div className='text-xs text-gray-400 dark:text-dark-500'>
+                {t('artifacts.dragEdgeToResize')}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
+  return createPortal(panel, document.body);
+};

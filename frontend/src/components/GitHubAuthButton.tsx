@@ -1,0 +1,110 @@
+/*
+ * Libre WebUI
+ * Copyright (C) 2025 Kroonen AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import React, { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { GitBranch, Loader2 } from 'lucide-react';
+import { API_BASE_URL } from '../utils/config';
+import { createLogger } from '@/utils/logger';
+
+const logger = createLogger('components:git-hub-auth-button');
+
+/**
+ * GitHub OAuth Button Component
+ * Only shows if GitHub OAuth is configured (env variables present)
+ */
+export const GitHubAuthButton: React.FC = () => {
+  const { t } = useTranslation();
+  const [isLoading, setIsLoading] = useState(false);
+  const [isConfigured, setIsConfigured] = useState(false);
+
+  // Check if GitHub OAuth is configured by testing the auth endpoint
+  useEffect(() => {
+    /**
+     * Check if GitHub OAuth is configured on the backend
+     */
+    const checkGitHubOAuthConfig = async () => {
+      try {
+        // Check the OAuth status endpoint instead of the auth endpoint
+        const response = await fetch(
+          `${API_BASE_URL}/auth/oauth/github/status`,
+          {
+            method: 'GET',
+            credentials: 'include',
+          }
+        );
+
+        if (response.ok) {
+          const data = await response.json();
+          setIsConfigured(data.configured || false);
+          logger.debug('GitHub OAuth configured:', data.configured);
+        } else {
+          logger.debug('GitHub OAuth status check failed');
+          setIsConfigured(false);
+        }
+      } catch (error) {
+        // GitHub OAuth not configured, hide the button
+        logger.debug('GitHub OAuth not configured:', error);
+        setIsConfigured(false);
+      }
+    };
+
+    checkGitHubOAuthConfig();
+    // OAuth callback handling is now done in useInitializeApp hook
+  }, []);
+
+  /**
+   * Initiate GitHub OAuth login
+   */
+  const handleGitHubLogin = () => {
+    if (!isConfigured || isLoading) {
+      return;
+    }
+
+    setIsLoading(true);
+
+    // Redirect to GitHub OAuth
+    const githubAuthUrl = `${API_BASE_URL}/auth/oauth/github`;
+    window.location.href = githubAuthUrl;
+  };
+
+  // Don't render if GitHub OAuth is not configured
+  if (!isConfigured) {
+    return null;
+  }
+
+  return (
+    <button
+      type='button'
+      onClick={handleGitHubLogin}
+      disabled={isLoading}
+      className='flex h-11 w-full items-center justify-center rounded-xl border border-line bg-surface-raised px-4 text-sm font-medium text-ink shadow-subtle transition-colors hover:border-line-strong hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:cursor-not-allowed disabled:opacity-40 motion-reduce:transition-none'
+    >
+      {isLoading ? (
+        <div className='flex items-center'>
+          <Loader2 size={16} className='me-2 animate-spin' />
+          {t('auth.oauth.connectingTo', { provider: t('auth.oauth.github') })}
+        </div>
+      ) : (
+        <div className='flex items-center'>
+          <GitBranch size={16} className='me-2' />
+          {t('auth.oauth.continueWith', { provider: t('auth.oauth.github') })}
+        </div>
+      )}
+    </button>
+  );
+};

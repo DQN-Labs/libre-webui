@@ -1,0 +1,270 @@
+name: Release
+
+permissions:
+  contents: write
+  pull-requests: read
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-preflight:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm run install:all
+
+      - name: Run release preflight
+        run: npm run release:check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Build Electron app for macOS
+  build-electron-mac:
+    needs: release-preflight
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm run install:all
+
+      - name: Build frontend and backend
+        run: npm run build
+
+      - name: Generate Electron icons
+        run: npm run generate-icons
+
+      - name: Build Electron app for macOS
+        run: npm run electron:build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ELECTRON_BUILD: true
+
+      - name: Verify macOS application signature
+        run: npm run electron:verify:mac
+
+      - name: Upload Electron artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: electron-frontend-mac-arm64
+          path: |
+            dist-electron/*.dmg
+            dist-electron/*.zip
+          if-no-files-found: warn
+
+  # Build Electron app for Windows
+  build-electron-win:
+    needs: release-preflight
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm run install:all
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-rebuild -f -w better-sqlite3
+
+      - name: Build frontend and backend
+        run: npm run build
+        env:
+          ELECTRON_BUILD: true
+
+      - name: Generate Electron icons
+        run: npm run generate-icons
+
+      - name: Build Electron app for Windows
+        run: npm run electron:build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ELECTRON_BUILD: true
+
+      - name: Upload Electron artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: electron-frontend-win
+          path: |
+            dist-electron/*.exe
+            dist-electron/*.msi
+          if-no-files-found: warn
+
+  # Build Electron app for Linux
+  build-electron-linux:
+    needs: release-preflight
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm run install:all
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-rebuild -f -w better-sqlite3
+
+      - name: Build frontend and backend
+        run: npm run build
+        env:
+          ELECTRON_BUILD: true
+
+      - name: Generate Electron icons
+        run: npm run generate-icons
+
+      - name: Build Electron app for Linux
+        run: npm run electron:build:linux
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ELECTRON_BUILD: true
+
+      - name: Upload Electron artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: electron-frontend-linux
+          path: |
+            dist-electron/*.AppImage
+            dist-electron/*.deb
+          if-no-files-found: warn
+
+  # Create the GitHub release with all artifacts
+  create-release:
+    needs: [build-electron-mac, build-electron-win, build-electron-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.22'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm run install:all
+
+      - name: Resolve release version
+        id: release_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Run tests and build
+        run: npm run release:check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION="${{ steps.release_version.outputs.version }}"
+          CHANGELOG_SECTION=$(awk "/^## \[$VERSION\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG_SECTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Download Electron artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: electron-builds
+        continue-on-error: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find electron-builds -type f 2>/dev/null || echo "No artifacts found"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.release_version.outputs.version }}
+          name: Release v${{ steps.release_version.outputs.version }}
+          body: ${{ steps.release_notes.outputs.notes }}
+          draft: false
+          prerelease: false
+          files: |
+            electron-builds/**/*.dmg
+            electron-builds/**/*.zip
+            electron-builds/**/*.exe
+            electron-builds/**/*.msi
+            electron-builds/**/*.AppImage
+            electron-builds/**/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror release to Forgejo
+        run: >-
+          node scripts/mirror-forgejo-releases.mjs
+          --tag "v${{ steps.release_version.outputs.version }}"
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker images
+        run: |
+          docker build -t libre-webui:${{ steps.release_version.outputs.version }} .
+          docker build -t libre-webui:latest .
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

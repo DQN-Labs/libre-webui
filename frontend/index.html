@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (() => {
+        let mode = 'dark';
+
+        try {
+          const savedState = JSON.parse(
+            localStorage.getItem('libre-webui-app-state') || 'null'
+          );
+
+          if (savedState?.state?.theme?.mode === 'light') {
+            mode = 'light';
+          }
+        } catch {
+          // Keep the dark default when persisted state is unavailable or invalid.
+        }
+
+        document.documentElement.classList.toggle('dark', mode === 'dark');
+        document.documentElement.style.colorScheme = mode;
+      })();
+    </script>
+    <!-- The SVG mark carries its own prefers-color-scheme rule, so the favicon
+         inverts with the OS theme. The PNG stays for browsers that do not
+         support SVG favicons. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-dark.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Libre WebUI</title>
+    <meta
+      name="description"
+      content="A modern, minimalist WebUI for interacting with local LLMs through Ollama API"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

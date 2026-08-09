@@ -1,0 +1,1094 @@
+/*
+ * Libre WebUI
+ * Copyright (C) 2025 Kroonen AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { v4 as uuidv4 } from 'uuid';
+import bcrypt from 'bcrypt';
+import getDatabase, { isDatabaseInitialized } from './db.js';
+import {
+  ChatSession,
+  DocumentChunk,
+  KnowledgeCollection,
+  Note,
+  SessionFolder,
+  UserPreferences,
+} from './types/index.js';
+import { encryptionService } from './services/encryptionService.js';
+import { createLogger } from './utils/logger.js';
+import {
+  MAX_NOTE_CONTENT_LENGTH,
+  MAX_NOTES_PER_USER,
+  MAX_NOTE_TITLE_LENGTH,
+  MAX_SESSION_FOLDER_NAME_LENGTH,
+  MAX_SESSION_FOLDERS_PER_USER,
+  ResourcePolicyError,
+} from './utils/resourceLimits.js';
+import {
+  mapDocumentChunkRow,
+  mapDocumentRow,
+  mapSessionRow,
+  type Document,
+  type DocumentChunkRow,
+  type DocumentRow,
+  type MessageRow,
+  type SessionFolderRow,
+  type SessionRow,
+  type User,
+} from './storageMappers.js';
+
+const logger = createLogger('storage');
+export type { Document, User } from './storageMappers.js';
+
+// Get __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+class StorageService {
+  private useSQLite = false;
+  private sessionsFile = path.join(__dirname, '..', 'sessions.json');
+  private preferencesFile = path.join(__dirname, '..', 'preferences.json');
+  private documentsFile = path.join(__dirname, '..', 'documents.json');
+  private documentChunksFile = path.join(
+    __dirname,
+    '..',
+    'document-chunks.json'
+  );
+
+  constructor() {
+    // Check if SQLite should be used
+    this.useSQLite = isDatabaseInitialized();
+    logger.debug(`Storage mode: ${this.useSQLite ? 'SQLite' : 'JSON'}`);
+  }
+
+  // =================================
+  // USER MANAGEMENT
+  // =================================
+
+  async createUser(
+    username: string,
+    email: string | undefined,
+    password: string,
+    role = 'user'
+  ): Promise<User> {
+    const userId = uuidv4();
+    const passwordHash = await bcrypt.hash(password, 12);
+    const now = Date.now();
+
+    const user: User = {
+      id: userId,
+      username,
+      email,
+      password_hash: passwordHash,
+      role,
+      created_at: now,
+      updated_at: now,
+    };
+
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(`
+        INSERT INTO users (id, username, email, password_hash, role, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      // Encrypt sensitive user data
+      const encryptedEmail = user.email
+        ? encryptionService.encrypt(user.email)
+        : null;
+
+      stmt.run(
+        user.id,
+        user.username,
+        encryptedEmail,
+        user.password_hash,
+        user.role,
+        user.created_at,
+        user.updated_at
+      );
+    }
+
+    return user;
+  }
+
+  getUser(userId: string): User | undefined {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+      const user = stmt.get(userId) as User | undefined;
+
+      if (user && user.email) {
+        // Decrypt email
+        user.email = encryptionService.decrypt(user.email);
+      }
+
+      return user;
+    }
+    return undefined;
+  }
+
+  getUserByUsername(username: string): User | undefined {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare('SELECT * FROM users WHERE username = ?');
+      const user = stmt.get(username) as User | undefined;
+
+      if (user && user.email) {
+        // Decrypt email
+        user.email = encryptionService.decrypt(user.email);
+      }
+
+      return user;
+    }
+    return undefined;
+  }
+
+  // =================================
+  // SESSION MANAGEMENT
+  // =================================
+
+  getAllSessions(userId = 'default'): ChatSession[] {
+    if (this.useSQLite) {
+      const db = getDatabase();
+
+      // Get sessions
+      const sessionsStmt = db.prepare(`
+        SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC
+      `);
+      const sessions = sessionsStmt.all(userId) as SessionRow[];
+
+      // Get ALL messages for each session (including branches for side-by-side display)
+      const messagesStmt = db.prepare(`
+        SELECT * FROM session_messages
+        WHERE session_id = ?
+        ORDER BY message_index ASC, branch_index ASC
+      `);
+
+      // Get sibling counts for branching (count all variants for each parent)
+      const siblingCountStmt = db.prepare(`
+        SELECT parent_id, COUNT(*) as count FROM session_messages
+        WHERE session_id = ? AND parent_id IS NOT NULL
+        GROUP BY parent_id
+      `);
+
+      return sessions.map(session => {
+        const messages = messagesStmt.all(session.id) as MessageRow[];
+        const siblingCounts = siblingCountStmt.all(session.id) as {
+          parent_id: string;
+          count: number;
+        }[];
+        return mapSessionRow(session, messages, siblingCounts);
+      });
+    } else {
+      // Fallback to JSON
+      try {
+        if (fs.existsSync(this.sessionsFile)) {
+          const data = fs.readFileSync(this.sessionsFile, 'utf8');
+          return JSON.parse(data) as ChatSession[];
+        }
+      } catch (error) {
+        logger.error('Failed to load sessions from JSON:', error);
+      }
+    }
+
+    return [];
+  }
+
+  getSession(sessionId: string, userId = 'default'): ChatSession | undefined {
+    if (this.useSQLite) {
+      const db = getDatabase();
+
+      // Get session
+      const sessionStmt = db.prepare(`
+        SELECT * FROM sessions WHERE id = ? AND user_id = ?
+      `);
+      const session = sessionStmt.get(sessionId, userId) as
+        SessionRow | undefined;
+
+      if (!session) return undefined;
+
+      // Get ALL messages (including branches for side-by-side display)
+      const messagesStmt = db.prepare(`
+        SELECT * FROM session_messages
+        WHERE session_id = ?
+        ORDER BY message_index ASC, branch_index ASC
+      `);
+      const messages = messagesStmt.all(sessionId) as MessageRow[];
+
+      // Get sibling counts for branching
+      const siblingCountStmt = db.prepare(`
+        SELECT parent_id, COUNT(*) as count FROM session_messages
+        WHERE session_id = ? AND parent_id IS NOT NULL
+        GROUP BY parent_id
+      `);
+      const siblingCounts = siblingCountStmt.all(sessionId) as {
+        parent_id: string;
+        count: number;
+      }[];
+
+      return mapSessionRow(session, messages, siblingCounts);
+    } else {
+      // Fallback to JSON
+      const sessions = this.getAllSessions();
+      return sessions.find(s => s.id === sessionId);
+    }
+  }
+
+  saveSession(session: ChatSession, userId = 'default'): void {
+    if (this.useSQLite) {
+      const db = getDatabase();
+
+      // Use transaction for consistency
+      const transaction = db.transaction((session: ChatSession) => {
+        // Insert or update session
+        const sessionStmt = db.prepare(`
+          INSERT OR REPLACE INTO sessions (id, user_id, title, model, persona_id, provider_type, provider_id, created_at, updated_at, archived, settings, folder_id, pinned)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        // Encrypt sensitive session data
+        const encryptedTitle = encryptionService.encrypt(session.title);
+
+        sessionStmt.run(
+          session.id,
+          userId,
+          encryptedTitle,
+          session.model,
+          session.personaId || null,
+          session.providerType || null,
+          session.providerId || null,
+          session.createdAt,
+          session.updatedAt,
+          session.archived ? 1 : 0,
+          session.settings
+            ? encryptionService.encrypt(JSON.stringify(session.settings))
+            : null,
+          session.folderId || null,
+          session.pinned ? 1 : 0
+        );
+
+        // Delete existing messages
+        const deleteMessagesStmt = db.prepare(
+          'DELETE FROM session_messages WHERE session_id = ?'
+        );
+        deleteMessagesStmt.run(session.id);
+
+        // Insert messages
+        if (session.messages && session.messages.length > 0) {
+          const insertMessageStmt = db.prepare(`
+            INSERT INTO session_messages (id, session_id, role, content, thinking, timestamp, message_index, model, provider_metadata, images, statistics, artifacts, parent_id, branch_index, is_active, rating)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+
+          session.messages.forEach((message, index) => {
+            // Encrypt sensitive data before storing
+            const encryptedContent = encryptionService.encrypt(message.content);
+            const encryptedThinking = message.thinking
+              ? encryptionService.encrypt(message.thinking)
+              : null;
+            const encryptedImages = message.images
+              ? encryptionService.encrypt(JSON.stringify(message.images))
+              : null;
+            const encryptedProviderMetadata = message.providerMetadata
+              ? encryptionService.encrypt(
+                  JSON.stringify(message.providerMetadata)
+                )
+              : null;
+            const encryptedStatistics = message.statistics
+              ? encryptionService.encrypt(JSON.stringify(message.statistics))
+              : null;
+            const encryptedArtifacts = message.artifacts
+              ? encryptionService.encrypt(JSON.stringify(message.artifacts))
+              : null;
+
+            // Use the message's own ID if it has one, otherwise generate a new one
+            const messageId = message.id || uuidv4();
+
+            insertMessageStmt.run(
+              messageId,
+              session.id,
+              message.role,
+              encryptedContent,
+              encryptedThinking,
+              message.timestamp,
+              index,
+              message.model || null,
+              encryptedProviderMetadata,
+              encryptedImages,
+              encryptedStatistics,
+              encryptedArtifacts,
+              message.parentId || null,
+              message.branchIndex ?? 0,
+              message.isActive !== false ? 1 : 0,
+              message.rating ?? null
+            );
+          });
+        }
+      });
+
+      transaction(session);
+    } else {
+      // Fallback to JSON
+      try {
+        const sessions = this.getAllSessions();
+        const existingIndex = sessions.findIndex(s => s.id === session.id);
+
+        if (existingIndex >= 0) {
+          sessions[existingIndex] = session;
+        } else {
+          sessions.push(session);
+        }
+
+        fs.writeFileSync(this.sessionsFile, JSON.stringify(sessions, null, 2));
+      } catch (error) {
+        logger.error('Failed to save session to JSON:', error);
+      }
+    }
+  }
+
+  deleteSession(sessionId: string, userId = 'default'): boolean {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(
+        'DELETE FROM sessions WHERE id = ? AND user_id = ?'
+      );
+      const result = stmt.run(sessionId, userId);
+      return result.changes > 0;
+    } else {
+      // Fallback to JSON
+      try {
+        const sessions = this.getAllSessions();
+        const filteredSessions = sessions.filter(s => s.id !== sessionId);
+
+        if (filteredSessions.length !== sessions.length) {
+          fs.writeFileSync(
+            this.sessionsFile,
+            JSON.stringify(filteredSessions, null, 2)
+          );
+          return true;
+        }
+      } catch (error) {
+        logger.error('Failed to delete session from JSON:', error);
+      }
+    }
+
+    return false;
+  }
+
+  // =================================
+  // KNOWLEDGE COLLECTIONS
+  // =================================
+
+  getKnowledgeCollections(userId = 'default'): KnowledgeCollection[] {
+    if (!this.useSQLite) return [];
+    const db = getDatabase();
+    const rows = db
+      .prepare(
+        'SELECT * FROM knowledge_collections WHERE user_id = ? ORDER BY name COLLATE NOCASE ASC'
+      )
+      .all(userId) as Array<{
+      id: string;
+      name: string;
+      created_at: number;
+      updated_at: number;
+    }>;
+    return rows.map(row => ({
+      id: row.id,
+      name: encryptionService.decrypt(row.name),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  saveKnowledgeCollection(
+    collection: KnowledgeCollection,
+    userId = 'default'
+  ): void {
+    if (!this.useSQLite) return;
+    const db = getDatabase();
+    db.prepare(
+      `INSERT OR REPLACE INTO knowledge_collections (id, user_id, name, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(
+      collection.id,
+      userId,
+      encryptionService.encrypt(collection.name),
+      collection.createdAt,
+      collection.updatedAt
+    );
+  }
+
+  deleteKnowledgeCollection(collectionId: string, userId = 'default'): boolean {
+    if (!this.useSQLite) return false;
+    const db = getDatabase();
+    const remove = db.transaction(() => {
+      db.prepare(
+        'UPDATE documents SET collection_id = NULL WHERE collection_id = ? AND user_id = ?'
+      ).run(collectionId, userId);
+      return db
+        .prepare(
+          'DELETE FROM knowledge_collections WHERE id = ? AND user_id = ?'
+        )
+        .run(collectionId, userId).changes;
+    });
+    return remove() > 0;
+  }
+
+  setDocumentCollection(
+    documentId: string,
+    collectionId: string | null,
+    userId = 'default'
+  ): boolean {
+    if (!this.useSQLite) return false;
+    const db = getDatabase();
+    return (
+      db
+        .prepare(
+          'UPDATE documents SET collection_id = ? WHERE id = ? AND user_id = ?'
+        )
+        .run(collectionId, documentId, userId).changes > 0
+    );
+  }
+
+  // =================================
+  // NOTES
+  // =================================
+
+  getNotes(userId = 'default'): Note[] {
+    if (!this.useSQLite) return [];
+    const db = getDatabase();
+    const rows = db
+      .prepare(
+        `SELECT * FROM notes
+         WHERE user_id = ?
+         ORDER BY updated_at DESC
+         LIMIT ?`
+      )
+      .all(userId, MAX_NOTES_PER_USER) as Array<{
+      id: string;
+      title: string;
+      content: string;
+      created_at: number;
+      updated_at: number;
+    }>;
+    return rows.map(row => ({
+      id: row.id,
+      title: encryptionService.decrypt(row.title),
+      content: encryptionService.decrypt(row.content),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  getNote(noteId: string, userId = 'default'): Note | undefined {
+    if (!this.useSQLite) return undefined;
+    const row = getDatabase()
+      .prepare('SELECT * FROM notes WHERE id = ? AND user_id = ?')
+      .get(noteId, userId) as
+      | {
+          id: string;
+          title: string;
+          content: string;
+          created_at: number;
+          updated_at: number;
+        }
+      | undefined;
+    return row
+      ? {
+          id: row.id,
+          title: encryptionService.decrypt(row.title),
+          content: encryptionService.decrypt(row.content),
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        }
+      : undefined;
+  }
+
+  saveNote(note: Note, userId = 'default'): void {
+    if (!this.useSQLite) return;
+    if (
+      note.title.length > MAX_NOTE_TITLE_LENGTH ||
+      note.content.length > MAX_NOTE_CONTENT_LENGTH
+    ) {
+      throw new ResourcePolicyError('Note exceeds the maximum size', 400);
+    }
+    const db = getDatabase();
+    const save = db.transaction(() => {
+      const existing = db
+        .prepare('SELECT 1 FROM notes WHERE id = ? AND user_id = ?')
+        .get(note.id, userId);
+      if (!existing) {
+        const { count } = db
+          .prepare('SELECT COUNT(*) AS count FROM notes WHERE user_id = ?')
+          .get(userId) as { count: number };
+        if (count >= MAX_NOTES_PER_USER) {
+          throw new ResourcePolicyError(
+            `A user may store at most ${MAX_NOTES_PER_USER} notes`,
+            409
+          );
+        }
+      }
+
+      db.prepare(
+        `INSERT OR REPLACE INTO notes (id, user_id, title, content, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(
+        note.id,
+        userId,
+        encryptionService.encrypt(note.title),
+        encryptionService.encrypt(note.content),
+        note.createdAt,
+        note.updatedAt
+      );
+    });
+    save();
+  }
+
+  deleteNote(noteId: string, userId = 'default'): boolean {
+    if (!this.useSQLite) return false;
+    const db = getDatabase();
+    return (
+      db
+        .prepare('DELETE FROM notes WHERE id = ? AND user_id = ?')
+        .run(noteId, userId).changes > 0
+    );
+  }
+
+  // =================================
+  // SESSION FOLDERS
+  // =================================
+
+  getSessionFolders(userId = 'default'): SessionFolder[] {
+    if (!this.useSQLite) return [];
+    const db = getDatabase();
+    const rows = db
+      .prepare(
+        `SELECT * FROM session_folders
+         WHERE user_id = ?
+         ORDER BY name COLLATE NOCASE ASC
+         LIMIT ?`
+      )
+      .all(userId, MAX_SESSION_FOLDERS_PER_USER) as SessionFolderRow[];
+    return rows.map(row => ({
+      id: row.id,
+      name: encryptionService.decrypt(row.name),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  saveSessionFolder(folder: SessionFolder, userId = 'default'): void {
+    if (!this.useSQLite) return;
+    if (
+      !folder.name.trim() ||
+      folder.name.length > MAX_SESSION_FOLDER_NAME_LENGTH
+    ) {
+      throw new ResourcePolicyError('Invalid session folder name', 400);
+    }
+    const db = getDatabase();
+    const save = db.transaction(() => {
+      const existing = db
+        .prepare('SELECT 1 FROM session_folders WHERE id = ? AND user_id = ?')
+        .get(folder.id, userId);
+      if (!existing) {
+        const { count } = db
+          .prepare(
+            'SELECT COUNT(*) AS count FROM session_folders WHERE user_id = ?'
+          )
+          .get(userId) as { count: number };
+        if (count >= MAX_SESSION_FOLDERS_PER_USER) {
+          throw new ResourcePolicyError(
+            `A user may store at most ${MAX_SESSION_FOLDERS_PER_USER} session folders`,
+            409
+          );
+        }
+      }
+
+      db.prepare(
+        `INSERT OR REPLACE INTO session_folders (id, user_id, name, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(
+        folder.id,
+        userId,
+        encryptionService.encrypt(folder.name),
+        folder.createdAt,
+        folder.updatedAt
+      );
+    });
+    save();
+  }
+
+  deleteSessionFolder(folderId: string, userId = 'default'): boolean {
+    if (!this.useSQLite) return false;
+    const db = getDatabase();
+    const remove = db.transaction(() => {
+      db.prepare(
+        'UPDATE sessions SET folder_id = NULL WHERE folder_id = ? AND user_id = ?'
+      ).run(folderId, userId);
+      return db
+        .prepare('DELETE FROM session_folders WHERE id = ? AND user_id = ?')
+        .run(folderId, userId).changes;
+    });
+    return remove() > 0;
+  }
+
+  clearAllSessions(userId = 'default'): number {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare('DELETE FROM sessions WHERE user_id = ?');
+      const result = stmt.run(userId);
+      return result.changes;
+    } else {
+      // Fallback to JSON
+      try {
+        const currentSessions = this.getAllSessions();
+        const deletedCount = currentSessions.length;
+        fs.writeFileSync(this.sessionsFile, JSON.stringify([], null, 2));
+        return deletedCount;
+      } catch (error) {
+        logger.error('Failed to clear all sessions from JSON:', error);
+        return 0;
+      }
+    }
+  }
+
+  // =================================
+  // PREFERENCES MANAGEMENT
+  // =================================
+
+  /**
+   * Safely decrypt and parse a preference value with proper error handling
+   * Returns null for corrupted data (which will be cleaned up)
+   */
+  private safeDecryptPreference(
+    key: string,
+    value: string,
+    _userId?: string
+  ): unknown | null {
+    try {
+      const decryptedValue = encryptionService.decrypt(value);
+      try {
+        return JSON.parse(decryptedValue);
+      } catch {
+        // Corrupted - will be cleaned up
+        return null;
+      }
+    } catch {
+      // Try as unencrypted legacy data
+      try {
+        return JSON.parse(value);
+      } catch {
+        // Corrupted - will be cleaned up
+        return null;
+      }
+    }
+  }
+
+  /**
+   * Delete a corrupted preference from the database
+   */
+  private deleteCorruptedPreference(userId: string, key: string): void {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      db.prepare(
+        'DELETE FROM user_preferences WHERE user_id = ? AND key = ?'
+      ).run(userId, key);
+      logger.debug(`Cleaned up corrupted preference: ${key}`);
+    }
+  }
+
+  getPreferences(userId?: string): UserPreferences | null {
+    if (this.useSQLite) {
+      const db = getDatabase();
+
+      // If no userId provided, get the first user (single-user mode)
+      if (!userId) {
+        const firstUser = db.prepare('SELECT id FROM users LIMIT 1').get() as
+          { id: string } | undefined;
+        if (firstUser) {
+          userId = firstUser.id;
+        } else {
+          return null; // No users found, return null
+        }
+      }
+
+      const stmt = db.prepare(
+        'SELECT key, value FROM user_preferences WHERE user_id = ?'
+      );
+      const rows = stmt.all(userId) as { key: string; value: string }[];
+
+      if (rows.length === 0) return null;
+
+      const preferences: Record<string, unknown> = {};
+      const corruptedKeys: string[] = [];
+
+      rows.forEach(row => {
+        const value = this.safeDecryptPreference(row.key, row.value, userId);
+        if (value === null) {
+          corruptedKeys.push(row.key);
+        } else {
+          preferences[row.key] = value;
+        }
+      });
+
+      // Clean up corrupted preferences
+      if (corruptedKeys.length > 0 && userId) {
+        corruptedKeys.forEach(key =>
+          this.deleteCorruptedPreference(userId!, key)
+        );
+      }
+
+      return Object.keys(preferences).length > 0
+        ? (preferences as unknown as UserPreferences)
+        : null;
+    } else {
+      // Fallback to JSON
+      try {
+        if (fs.existsSync(this.preferencesFile)) {
+          const data = fs.readFileSync(this.preferencesFile, 'utf8');
+          return JSON.parse(data) as UserPreferences;
+        }
+      } catch (error) {
+        logger.error('Failed to load preferences from JSON:', error);
+      }
+    }
+
+    return null;
+  }
+
+  savePreferences(preferences: UserPreferences, userId?: string): void {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const now = Date.now();
+
+      // If no userId provided, get the first user (single-user mode)
+      if (!userId) {
+        const firstUser = db.prepare('SELECT id FROM users LIMIT 1').get() as
+          { id: string } | undefined;
+        if (firstUser) {
+          userId = firstUser.id;
+        } else {
+          throw new Error('No users found in database');
+        }
+      }
+
+      const transaction = db.transaction((preferences: UserPreferences) => {
+        // Delete existing preferences for this user
+        const deleteStmt = db.prepare(
+          'DELETE FROM user_preferences WHERE user_id = ?'
+        );
+        deleteStmt.run(userId);
+
+        // Insert new preferences
+        const insertStmt = db.prepare(`
+          INSERT INTO user_preferences (id, user_id, key, value, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `);
+
+        Object.entries(preferences).forEach(([key, value]) => {
+          // Skip undefined values - they would cause NOT NULL constraint errors
+          if (value === undefined) {
+            return;
+          }
+
+          // Encrypt the preference value before storing
+          const encryptedValue = encryptionService.encrypt(
+            JSON.stringify(value)
+          );
+
+          insertStmt.run(uuidv4(), userId, key, encryptedValue, now, now);
+        });
+      });
+
+      transaction(preferences);
+    } else {
+      // Fallback to JSON
+      try {
+        fs.writeFileSync(
+          this.preferencesFile,
+          JSON.stringify(preferences, null, 2)
+        );
+      } catch (error) {
+        logger.error('Failed to save preferences to JSON:', error);
+      }
+    }
+  }
+
+  // =================================
+  // DOCUMENT MANAGEMENT
+  // =================================
+
+  getAllDocuments(userId = 'default'): Document[] {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(`
+        SELECT * FROM documents WHERE user_id = ? ORDER BY uploaded_at DESC
+      `);
+      const rows = stmt.all(userId) as DocumentRow[];
+
+      return rows.map(mapDocumentRow);
+    } else {
+      // Fallback to JSON
+      try {
+        if (fs.existsSync(this.documentsFile)) {
+          const data = fs.readFileSync(this.documentsFile, 'utf8');
+          return JSON.parse(data) as Document[];
+        }
+      } catch (error) {
+        logger.error('Failed to load documents from JSON:', error);
+      }
+    }
+
+    return [];
+  }
+
+  getDocument(documentId: string, userId = 'default'): Document | undefined {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(
+        'SELECT * FROM documents WHERE id = ? AND user_id = ?'
+      );
+      const row = stmt.get(documentId, userId) as DocumentRow | undefined;
+
+      if (!row) return undefined;
+
+      return mapDocumentRow(row);
+    } else {
+      // Fallback to JSON
+      const documents = this.getAllDocuments();
+      return documents.find(d => d.id === documentId);
+    }
+  }
+
+  saveDocument(document: Document, userId = 'default'): void {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const now = Date.now();
+
+      const stmt = db.prepare(`
+        INSERT OR REPLACE INTO documents 
+        (id, user_id, filename, title, content, file_type, size, session_id, collection_id, metadata, uploaded_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      // Encrypt sensitive document data
+      const encryptedTitle = document.title
+        ? encryptionService.encrypt(document.title)
+        : null;
+      const encryptedContent = document.content
+        ? encryptionService.encrypt(document.content)
+        : null;
+      const encryptedMetadata = document.metadata
+        ? encryptionService.encrypt(JSON.stringify(document.metadata))
+        : null;
+
+      stmt.run(
+        document.id,
+        userId,
+        document.filename,
+        encryptedTitle,
+        encryptedContent,
+        document.fileType || null,
+        document.size || null,
+        document.sessionId || null,
+        document.collectionId || null,
+        encryptedMetadata,
+        document.uploadedAt,
+        document.createdAt || now,
+        now
+      );
+    } else {
+      // Fallback to JSON
+      try {
+        const documents = this.getAllDocuments();
+        const existingIndex = documents.findIndex(d => d.id === document.id);
+
+        if (existingIndex >= 0) {
+          documents[existingIndex] = document;
+        } else {
+          documents.push(document);
+        }
+
+        fs.writeFileSync(
+          this.documentsFile,
+          JSON.stringify(documents, null, 2)
+        );
+      } catch (error) {
+        logger.error('Failed to save document to JSON:', error);
+      }
+    }
+  }
+
+  deleteDocument(documentId: string, userId = 'default'): boolean {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(
+        'DELETE FROM documents WHERE id = ? AND user_id = ?'
+      );
+      const result = stmt.run(documentId, userId);
+      return result.changes > 0;
+    } else {
+      // Fallback to JSON
+      try {
+        const documents = this.getAllDocuments();
+        const filteredDocuments = documents.filter(d => d.id !== documentId);
+
+        if (filteredDocuments.length !== documents.length) {
+          fs.writeFileSync(
+            this.documentsFile,
+            JSON.stringify(filteredDocuments, null, 2)
+          );
+          return true;
+        }
+      } catch (error) {
+        logger.error('Failed to delete document from JSON:', error);
+      }
+    }
+
+    return false;
+  }
+
+  // =================================
+  // DOCUMENT CHUNKS MANAGEMENT
+  // =================================
+
+  getDocumentChunks(documentId: string): DocumentChunk[] {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(`
+        SELECT * FROM document_chunks WHERE document_id = ? ORDER BY chunk_index ASC
+      `);
+      const rows = stmt.all(documentId) as DocumentChunkRow[];
+
+      return rows.map(mapDocumentChunkRow);
+    } else {
+      // Fallback to JSON
+      try {
+        if (fs.existsSync(this.documentChunksFile)) {
+          const data = fs.readFileSync(this.documentChunksFile, 'utf8');
+          const chunksData = JSON.parse(data);
+          return chunksData[documentId] || [];
+        }
+      } catch (error) {
+        logger.error('Failed to load document chunks from JSON:', error);
+      }
+    }
+
+    return [];
+  }
+
+  saveDocumentChunks(documentId: string, chunks: DocumentChunk[]): void {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const now = Date.now();
+
+      const transaction = db.transaction(
+        (documentId: string, chunks: DocumentChunk[]) => {
+          // Delete existing chunks
+          const deleteStmt = db.prepare(
+            'DELETE FROM document_chunks WHERE document_id = ?'
+          );
+          deleteStmt.run(documentId);
+
+          // Insert new chunks
+          if (chunks.length > 0) {
+            const insertStmt = db.prepare(`
+            INSERT INTO document_chunks 
+            (id, document_id, chunk_index, content, start_char, end_char, embedding, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+
+            chunks.forEach(chunk => {
+              // Encrypt chunk data
+              const encryptedContent = encryptionService.encrypt(chunk.content);
+              const encryptedEmbedding = chunk.embedding
+                ? encryptionService.encrypt(JSON.stringify(chunk.embedding))
+                : null;
+
+              insertStmt.run(
+                chunk.id,
+                documentId,
+                chunk.chunkIndex,
+                encryptedContent,
+                chunk.startChar || null,
+                chunk.endChar || null,
+                encryptedEmbedding,
+                now
+              );
+            });
+          }
+        }
+      );
+
+      transaction(documentId, chunks);
+    } else {
+      // Fallback to JSON
+      try {
+        let chunksData: Record<string, DocumentChunk[]> = {};
+        if (fs.existsSync(this.documentChunksFile)) {
+          const data = fs.readFileSync(this.documentChunksFile, 'utf8');
+          chunksData = JSON.parse(data);
+        }
+
+        chunksData[documentId] = chunks;
+        fs.writeFileSync(
+          this.documentChunksFile,
+          JSON.stringify(chunksData, null, 2)
+        );
+      } catch (error) {
+        logger.error('Failed to save document chunks to JSON:', error);
+      }
+    }
+  }
+
+  deleteDocumentChunks(documentId: string): boolean {
+    if (this.useSQLite) {
+      const db = getDatabase();
+      const stmt = db.prepare(
+        'DELETE FROM document_chunks WHERE document_id = ?'
+      );
+      const result = stmt.run(documentId);
+      return result.changes > 0;
+    } else {
+      // Fallback to JSON
+      try {
+        if (fs.existsSync(this.documentChunksFile)) {
+          const data = fs.readFileSync(this.documentChunksFile, 'utf8');
+          const chunksData = JSON.parse(data);
+
+          if (chunksData[documentId]) {
+            delete chunksData[documentId];
+            fs.writeFileSync(
+              this.documentChunksFile,
+              JSON.stringify(chunksData, null, 2)
+            );
+            return true;
+          }
+        }
+      } catch (error) {
+        logger.error('Failed to delete document chunks from JSON:', error);
+      }
+    }
+
+    return false;
+  }
+}
+
+// Export singleton instance
+const storageService = new StorageService();
+export default storageService;

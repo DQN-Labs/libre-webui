@@ -1,0 +1,184 @@
+---
+sidebar_position: 4
+title: 'Pro Tips'
+description: 'Practical workflows for getting more out of Libre WebUI.'
+slug: /PRO_TIPS
+keywords: [libre webui pro tips, ai workflows, ollama tips, productivity]
+---
+
+# Pro Tips
+
+This page collects practical workflows that make Libre WebUI feel faster, cleaner, and more reliable in daily use.
+
+## Keep a Small Daily Model Loaded
+
+Use a fast local model for routine work and switch to larger models only when the task needs it.
+
+Good daily-driver examples:
+
+- `gemma3:4b` for fast everyday chat
+- `qwen3:8b` for stronger general work
+- `deepseek-r1:8b` for reasoning prompts
+- `nomic-embed-text` for document embeddings
+
+Open **Models** to see which models are running. Unload models you are not using when VRAM gets tight.
+
+## Use Incognito Chat for Conversations That Should Not Persist
+
+Start an incognito chat from the tab bar's `+` menu, the command palette, the
+Home page, or the ghost button on the chat welcome screen. It also has a
+direct URL: `/chat?incognito=1`.
+
+An incognito chat is never persisted: no session is created on the server, no
+message is saved, and it never appears in the sidebar or history. The chat
+shows a **Private Mode** banner ("This conversation won't be saved"). Opening
+a saved chat leaves incognito mode; reloading an incognito tab starts a fresh
+empty private chat, so the previous turns are gone.
+
+Be clear about the boundary: incognito controls persistence, not provider
+exposure. The selected model — local or remote — still receives the full
+conversation, and document context still applies when it is enabled. For a
+conversation that must not leave your infrastructure, combine incognito with a
+local Ollama model.
+
+## Manage Tabs with the Context Menu
+
+Right-click a tab (or press `Shift + F10` on a focused tab) for:
+
+- **Close tab**
+- **Close other tabs**
+- **Close tabs to the right**
+- **Close all tabs**
+
+Home is always the first tab and cannot be closed. Administrators also get
+direct **Users**, **System**, and **Usage** entries in the `+` menu.
+
+## Theme Default
+
+New installs use the dark theme, applied before first paint so there is no
+light flash. A saved light preference is always respected. Libre WebUI does
+not follow the operating system's theme setting; switch explicitly with
+`Cmd/Ctrl + D` or from Settings.
+
+## Keep Work Tasks Focused
+
+Use a separate Work task for each project or independent goal. Every task has
+its own conversation, managed container identity, and persistent files. The
+container itself can stop or be recreated while its named volume survives, so
+reusing the same task preserves useful context while starting a new task creates
+a clean boundary.
+
+A good first instruction gives the model:
+
+- The result you want.
+- Important technical or design constraints.
+- The command or behavior that should verify completion.
+- Any files or interfaces that must remain unchanged.
+
+Follow progress in **Activity**, then inspect and test the result in **Files**
+and **Preview**. The file editor supports syntax highlighting in light and dark
+themes, browser-backed unsaved drafts, and formatting for supported file types.
+Use `Cmd/Ctrl + S` to save and `Shift + Alt + F` to format.
+
+Use an installed tool-capable Ollama model when you want model traffic to stay
+on your configured Ollama infrastructure. A remote or cloud model can reduce
+local inference memory pressure, but it can make multiple billable calls and
+receives requested tool results, which may contain workspace data.
+
+Stopping a run or preview keeps the workspace. Deleting a Work task removes its
+workspace permanently, so copy out anything you need first.
+
+## Use Personas for Repeatable Work
+
+Create personas for workflows you repeat:
+
+- A concise code reviewer with low temperature.
+- A writing editor with a clear style guide.
+- A research assistant with document search enabled.
+- A support assistant with a fixed tone and response structure.
+
+Personas store the selected model, system prompt, generation parameters, avatar/background, and optional memory/mutation settings. They can also be exported and imported as JSON.
+
+## Make Artifacts More Reliable
+
+Libre WebUI detects explicit artifact tags, fenced code blocks, standalone HTML documents, and common multi-file HTML bundles. To get the best artifact output from a model, ask for:
+
+```text
+Create one complete self-contained HTML file.
+Inline the CSS and JavaScript.
+Do not rely on external files unless they are CDN URLs.
+```
+
+If you want separate blocks, name them clearly:
+
+````markdown
+```html filename="index.html"
+...
+```
+
+```css filename="style.css"
+...
+```
+
+```js filename="app.js"
+...
+```
+````
+
+Libre WebUI will try to bundle local CSS and JavaScript blocks into the HTML preview.
+
+## Use Document Chat Deliberately
+
+Document Chat currently accepts PDF and plain-text files up to 10 MB. Search works in two modes:
+
+- Keyword search is always available.
+- Semantic search is used when embeddings are enabled in Settings and an embedding model is available.
+
+Install `nomic-embed-text` if you want an easy local embedding model:
+
+```bash
+ollama pull nomic-embed-text
+```
+
+For best results, upload focused documents per chat instead of one huge mixed document set.
+
+## Tune Generation Settings
+
+| Setting        | Practical use                                                       |
+| -------------- | ------------------------------------------------------------------- |
+| Temperature    | Lower for accuracy, higher for creative exploration                 |
+| Top P / Top K  | Leave defaults unless you are deliberately tuning sampling          |
+| Context window | Increase for long chats only if your model and memory can handle it |
+| Max tokens     | Limit long answers or raise for code/artifact generation            |
+| Repeat penalty | Raise slightly when a model loops                                   |
+
+When a model behaves badly, first lower temperature, then reduce context pressure, then try another model.
+
+## Keep Provider Keys Per User
+
+Provider plugins can read environment keys, but user-level credentials are usually cleaner for shared installs. Add keys in Settings so each user controls their own provider access.
+
+Use backend environment variables for deployment-wide defaults or automated installs.
+
+## Make Remote Access Predictable
+
+For phone or LAN access, bind the dev server to the network interface:
+
+```bash
+npm run dev:host
+```
+
+Then open the machine’s LAN or Tailscale IP from the other device. In production, set `CORS_ORIGIN` and the frontend API URL explicitly so browsers do not fall back to localhost.
+
+## Keep Docs and UI in Sync
+
+The product changes quickly. Prefer durable docs that describe behavior and workflows, and let the UI show live model lists from providers. Avoid copying long provider catalogs into docs unless the list is generated by the app.
+
+## Related Docs
+
+- [Work: Isolated Workspaces](./WORKSPACES)
+- [Working with Models](./WORKING_WITH_MODELS)
+- [Document Chat](./RAG_FEATURE)
+- [Artifacts](./ARTIFACTS_FEATURE)
+- [Personas](./PERSONA_DEVELOPMENT_FRAMEWORK)
+- [Environment Variables](./ENVIRONMENT_VARIABLES)

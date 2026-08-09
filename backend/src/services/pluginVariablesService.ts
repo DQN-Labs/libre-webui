@@ -1,0 +1,382 @@
+/*
+ * Libre WebUI
+ * Copyright (C) 2025 Kroonen AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { v4 as uuidv4 } from 'uuid';
+import { getDatabaseSafe } from '../db.js';
+import { encryptionService } from './encryptionService.js';
+import { PluginVariableDefinition } from '../types/index.js';
+import { createLogger } from '../utils/logger.js';
+import { PLUGIN_CONNECTION_VARIABLE_NAMES } from '../utils/pluginConnectionVariables.js';
+
+const logger = createLogger('services:plugin-variables-service');
+
+interface VariableRow {
+  id: string;
+  variable_name: string;
+  variable_value: string;
+  is_encrypted: number;
+  updated_at: number;
+}
+
+export interface PluginVariableValue {
+  name: string;
+  value: string | number | boolean;
+  is_sensitive: boolean;
+  has_value: boolean;
+}
+
+class PluginVariablesService {
+  // Cache resolved variables with a 5-second TTL to avoid DB reads on every request
+  private resolvedCache = new Map<
+    string,
+    { data: Record<string, string | number | boolean>; expires: number }
+  >();
+
+  private getCacheKey(pluginId: string, userId: string): string {
+    return `${pluginId}:${userId}`;
+  }
+
+  private invalidateCache(pluginId: string, userId?: string): void {
+    if (userId) {
+      this.resolvedCache.delete(this.getCacheKey(pluginId, userId));
+    } else {
+      // Invalidate all entries for this plugin
+      for (const key of this.resolvedCache.keys()) {
+        if (key.startsWith(`${pluginId}:`)) {
+          this.resolvedCache.delete(key);
+        }
+      }
+    }
+  }
+
+  /**
+   * Get all variable values for a plugin, merged with schema defaults.
+   * If forDisplay is true, sensitive values are masked.
+   */
+  getVariables(
+    pluginId: string,
+    schema: PluginVariableDefinition[],
+    userId?: string,
+    forDisplay = false
+  ): Record<string, PluginVariableValue> {
+    const effectiveUserId = userId || 'default';
+    const db = getDatabaseSafe();
+    const result: Record<string, PluginVariableValue> = {};
+
+    // Initialize with defaults from schema
+    for (const def of schema) {
+      const isSensitive = def.sensitive ?? false;
+      result[def.name] = {
+        name: def.name,
+        value: forDisplay && isSensitive ? '' : (def.default ?? ''),
+        is_sensitive: isSensitive,
+        has_value: false,
+      };
+    }
+
+    if (!db) return result;
+
+    try {
+      const rows = db
+        .prepare(
+          'SELECT variable_name, variable_value, is_encrypted, updated_at FROM plugin_variables WHERE plugin_id = ? AND user_id = ?'
+        )
+        .all(pluginId, effectiveUserId) as VariableRow[];
+
+      for (const row of rows) {
+        const def = schema.find(d => d.name === row.variable_name);
+        if (!def) continue;
+
+        let value: string | number | boolean = row.variable_value;
+
+        // Decrypt if encrypted
+        if (row.is_encrypted) {
+          const decrypted = encryptionService.decrypt(row.variable_value);
+          if (!decrypted) continue;
+          value = decrypted;
+        }
+
+        // Cast to correct type
+        if (def.type === 'number') {
+          value = Number(value);
+        } else if (def.type === 'boolean') {
+          value = String(value) === 'true';
+        }
+
+        if (forDisplay && def.sensitive) {
+          result[def.name] = {
+            name: def.name,
+            value: '••••••••',
+            is_sensitive: true,
+            has_value: true,
+          };
+        } else {
+          result[def.name] = {
+            name: def.name,
+            value,
+            is_sensitive: def.sensitive ?? false,
+            has_value: true,
+          };
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to get variables for plugin %s:', pluginId, error);
+    }
+
+    return result;
+  }
+
+  /**
+   * Get resolved variable values for runtime use (decrypted, typed).
+   */
+  getResolvedVariables(
+    pluginId: string,
+    schema: PluginVariableDefinition[],
+    userId?: string
+  ): Record<string, string | number | boolean> {
+    const effectiveUserId = userId || 'default';
+    const cacheKey = this.getCacheKey(pluginId, effectiveUserId);
+    const cached = this.resolvedCache.get(cacheKey);
+
+    if (cached && cached.expires > Date.now()) {
+      return cached.data;
+    }
+
+    const vars = this.getVariables(pluginId, schema, userId, false);
+    const result: Record<string, string | number | boolean> = {};
+    for (const [key, val] of Object.entries(vars)) {
+      result[key] = val.value;
+    }
+
+    this.resolvedCache.set(cacheKey, {
+      data: result,
+      expires: Date.now() + 5000, // 5 second TTL
+    });
+
+    return result;
+  }
+
+  /**
+   * Whether this user stored a non-empty connection-routing override.
+   * Schema defaults are manifest-owned and intentionally do not count.
+   */
+  hasStoredConnectionOverride(
+    pluginId: string,
+    userId?: string,
+    schema?: PluginVariableDefinition[],
+    connectionVariableNames: ReadonlySet<string> = PLUGIN_CONNECTION_VARIABLE_NAMES
+  ): boolean {
+    const effectiveUserId = userId || 'default';
+    const db = getDatabaseSafe();
+    if (!db) return false;
+    const configuredConnectionNames = schema
+      ? new Set(
+          schema
+            .map(definition => definition.name)
+            .filter(name => connectionVariableNames.has(name))
+        )
+      : undefined;
+
+    try {
+      const rows = db
+        .prepare(
+          `SELECT variable_name, variable_value, is_encrypted
+           FROM plugin_variables
+           WHERE plugin_id = ? AND user_id = ?`
+        )
+        .all(pluginId, effectiveUserId) as Array<
+        Pick<VariableRow, 'variable_name' | 'variable_value' | 'is_encrypted'>
+      >;
+
+      return rows.some(row => {
+        if (!connectionVariableNames.has(row.variable_name)) return false;
+        if (
+          configuredConnectionNames &&
+          !configuredConnectionNames.has(row.variable_name)
+        ) {
+          return false;
+        }
+        const value = row.is_encrypted
+          ? encryptionService.decrypt(row.variable_value)
+          : row.variable_value;
+        return typeof value === 'string' && value.trim().length > 0;
+      });
+    } catch (error) {
+      logger.error(
+        'Failed to inspect connection overrides for plugin %s:',
+        pluginId,
+        error
+      );
+      // Credential fallback is the sensitive operation. Fail closed if the
+      // stored routing state cannot be inspected.
+      return true;
+    }
+  }
+
+  /**
+   * Set multiple variable values for a plugin.
+   */
+  setVariables(
+    pluginId: string,
+    variables: Record<string, string | number | boolean>,
+    schema: PluginVariableDefinition[],
+    userId?: string,
+    variablesToUnset: string[] = []
+  ): boolean {
+    const effectiveUserId = userId || 'default';
+    const db = getDatabaseSafe();
+
+    if (!db) {
+      logger.error('Database not available for storing plugin variables');
+      return false;
+    }
+
+    try {
+      const now = Date.now();
+      const schemaNames = new Set(schema.map(definition => definition.name));
+      const variableNames = Object.keys(variables);
+      const unsetNames = [...new Set(variablesToUnset)];
+      const unknownName = [...variableNames, ...unsetNames].find(
+        name => !schemaNames.has(name)
+      );
+      if (unknownName) {
+        logger.error(
+          'Cannot store unknown variable %s for plugin %s',
+          unknownName,
+          pluginId
+        );
+        return false;
+      }
+      const submittedNames = new Set(variableNames);
+      const overlap = unsetNames.find(name => submittedNames.has(name));
+      if (overlap) {
+        logger.error(
+          'Cannot both set and unset variable %s for plugin %s',
+          overlap,
+          pluginId
+        );
+        return false;
+      }
+
+      const transaction = db.transaction(() => {
+        for (const name of unsetNames) {
+          db.prepare(
+            'DELETE FROM plugin_variables WHERE plugin_id = ? AND user_id = ? AND variable_name = ?'
+          ).run(pluginId, effectiveUserId, name);
+        }
+
+        for (const [name, value] of Object.entries(variables)) {
+          const def = schema.find(d => d.name === name);
+          if (!def) continue;
+
+          const stringValue = String(value);
+          const isSensitive = def.sensitive ?? false;
+          const storedValue = isSensitive
+            ? encryptionService.encrypt(stringValue)
+            : stringValue;
+
+          const existing = db
+            .prepare(
+              'SELECT id FROM plugin_variables WHERE plugin_id = ? AND user_id = ? AND variable_name = ?'
+            )
+            .get(pluginId, effectiveUserId, name) as { id: string } | undefined;
+
+          if (existing) {
+            db.prepare(
+              'UPDATE plugin_variables SET variable_value = ?, is_encrypted = ?, updated_at = ? WHERE id = ?'
+            ).run(storedValue, isSensitive ? 1 : 0, now, existing.id);
+          } else {
+            const id = uuidv4();
+            db.prepare(
+              'INSERT INTO plugin_variables (id, user_id, plugin_id, variable_name, variable_value, is_encrypted, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            ).run(
+              id,
+              effectiveUserId,
+              pluginId,
+              name,
+              storedValue,
+              isSensitive ? 1 : 0,
+              now,
+              now
+            );
+          }
+        }
+      });
+
+      transaction();
+      this.invalidateCache(pluginId, effectiveUserId);
+      return true;
+    } catch (error) {
+      logger.error('Failed to set variables for plugin %s:', pluginId, error);
+      return false;
+    }
+  }
+
+  /**
+   * Delete all variables for a plugin (reset to defaults).
+   */
+  deletePluginVariables(pluginId: string, userId?: string): boolean {
+    const db = getDatabaseSafe();
+    if (!db) return false;
+
+    try {
+      if (userId) {
+        db.prepare(
+          'DELETE FROM plugin_variables WHERE plugin_id = ? AND user_id = ?'
+        ).run(pluginId, userId);
+      } else {
+        db.prepare('DELETE FROM plugin_variables WHERE plugin_id = ?').run(
+          pluginId
+        );
+      }
+      this.invalidateCache(pluginId, userId);
+      return true;
+    } catch (error) {
+      logger.error(
+        'Failed to delete variables for plugin %s:',
+        pluginId,
+        error
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Delete all variables for a user (used on account deletion).
+   */
+  deleteUserVariables(userId: string): boolean {
+    const db = getDatabaseSafe();
+    if (!db) return false;
+
+    try {
+      db.prepare('DELETE FROM plugin_variables WHERE user_id = ?').run(userId);
+      // Clear all cache entries for this user
+      for (const key of this.resolvedCache.keys()) {
+        if (key.endsWith(`:${userId}`)) {
+          this.resolvedCache.delete(key);
+        }
+      }
+      return true;
+    } catch (error) {
+      logger.error(`Failed to delete all variables for user ${userId}:`, error);
+      return false;
+    }
+  }
+}
+
+const pluginVariablesService = new PluginVariablesService();
+export default pluginVariablesService;
