@@ -22,19 +22,16 @@ import {
   ChatMessage,
   OllamaModel,
   GenerationStatistics,
-  Persona,
   ChatProviderType,
   SessionFolder,
+  Persona,
 } from '@/types';
-import { chatApi, ollamaApi, preferencesApi, personaApi } from '@/utils/api';
-import { pluginApi } from '@/utils/api';
+import { preferencesApi } from '@/utils/api';
+import { directApi } from '@/utils/api/directApi';
 import { createLogger } from '@/utils/logger';
 import toast from 'react-hot-toast';
 import {
   appendMessageToChatState,
-  buildPersonaModels,
-  buildPersonasById,
-  buildPluginModels,
   createChatMessage,
   getErrorMessage,
   hasSession,
@@ -45,7 +42,6 @@ import {
 } from '@/store/chatStoreHelpers';
 import {
   chatModelSelectionFromModel,
-  findChatModelForSelection,
 } from '@/utils/chatModelSelection';
 
 const logger = createLogger('chat-store');
@@ -183,7 +179,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   ) => {
     try {
       set({ loading: true, error: null });
-      const response = await chatApi.createSession(
+      const response = await directApi.createSession(
         model,
         title,
         personaId,
@@ -216,7 +212,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadSessions: async () => {
     try {
       set({ loading: true, error: null });
-      const response = await chatApi.getSessions();
+      const response = await directApi.getSessions();
       if (response.success && response.data) {
         set(prevState => {
           const sessions = response.data || [];
@@ -258,7 +254,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   deleteSession: async (sessionId: string) => {
     try {
-      const response = await chatApi.deleteSession(sessionId);
+      const response = await directApi.deleteSession(sessionId);
       if (response.success) {
         set(state => {
           const updatedSessions = state.sessions.filter(
@@ -294,7 +290,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearAllSessions: async () => {
     try {
       set({ loading: true, error: null });
-      const response = await chatApi.clearAllSessions();
+      const response = await directApi.clearAllSessions();
 
       if (response.success) {
         set({
@@ -356,7 +352,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   updateSessionTitle: async (sessionId: string, title: string) => {
     try {
-      const response = await chatApi.updateSession(sessionId, { title });
+      const response = await directApi.updateSession(sessionId, { title });
 
       if (response.success && response.data) {
         const updatedTitle = response.data.title;
@@ -461,7 +457,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     try {
-      await chatApi.updateMessage(sessionId, messageId, {
+      await directApi.updateMessage(sessionId, messageId, {
         rating: rating ?? null,
       } as Partial<ChatMessage>);
     } catch (error) {
@@ -473,7 +469,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadFolders: async () => {
     try {
-      const response = await chatApi.getFolders();
+      const response = await directApi.getFolders();
       if (response.success && response.data) {
         set({ folders: response.data });
       }
@@ -484,7 +480,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   createFolder: async (name: string) => {
     try {
-      const response = await chatApi.createFolder(name);
+      const response = await directApi.createFolder(name);
       if (response.success && response.data) {
         const folder = response.data;
         set(state => ({
@@ -502,7 +498,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   renameFolder: async (folderId: string, name: string) => {
     try {
-      const response = await chatApi.renameFolder(folderId, name);
+      const response = await directApi.renameFolder(folderId, name);
       if (response.success && response.data) {
         const folder = response.data;
         set(state => ({
@@ -518,7 +514,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   deleteFolder: async (folderId: string) => {
     try {
-      const response = await chatApi.deleteFolder(folderId);
+      const response = await directApi.deleteFolder(folderId);
       if (response.success) {
         set(state => ({
           folders: state.folders.filter(item => item.id !== folderId),
@@ -549,7 +545,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           : state.currentSession,
     }));
     try {
-      await chatApi.updateSession(sessionId, {
+      await directApi.updateSession(sessionId, {
         folderId,
       } as Partial<ChatSession>);
     } catch (error) {
@@ -569,7 +565,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     try {
-      await chatApi.updateSession(sessionId, {
+      await directApi.updateSession(sessionId, {
         archived,
       } as Partial<ChatSession>);
     } catch (error) {
@@ -597,7 +593,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     try {
-      await chatApi.updateSession(sessionId, {
+      await directApi.updateSession(sessionId, {
         pinned,
       } as Partial<ChatSession>);
     } catch (error) {
@@ -643,182 +639,45 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadModels: async () => {
     try {
       set({ loading: true, error: null });
-      logger.debug('Loading models from API...');
+      logger.debug('Loading models from providers...');
 
+      const modelsResponse = await directApi.getModels();
       let allModels: OllamaModel[] = [];
-      let ollamaLoadError: unknown;
 
-      // Ollama and plugins are independent providers. Keep loading configured
-      // plugin models when the local Ollama endpoint is offline.
-      try {
-        const ollamaResponse = await ollamaApi.getModels();
-        if (ollamaResponse.success && ollamaResponse.data) {
-          allModels = [...ollamaResponse.data];
-          logger.debug('Ollama models loaded:', ollamaResponse.data.length);
-        } else {
-          ollamaLoadError = new Error(
-            ollamaResponse.error ||
-              ollamaResponse.message ||
-              'Ollama models are unavailable.'
-          );
-        }
-      } catch (error) {
-        ollamaLoadError = error;
-        logger.warn(
-          'Ollama models are unavailable; continuing with plugin models:',
-          error
-        );
+      if (modelsResponse.success && modelsResponse.data) {
+        allModels = modelsResponse.data.map(m => ({
+          name: m.id,
+          model: m.id,
+          size: 0,
+          digest: '',
+          modified_at: '',
+          details: {},
+        }));
       }
 
-      // Load plugin models
-      try {
-        const pluginsResponse = await pluginApi.getAllPlugins();
-        if (pluginsResponse.success && pluginsResponse.data) {
-          const activePlugins = pluginsResponse.data.filter(
-            plugin =>
-              plugin.active && plugin.type !== 'tts' && plugin.type !== 'image'
-          );
-          logger.debug(
-            '🔌 Active plugins found:',
-            activePlugins.map(p => p.name)
-          );
+      logger.debug('Models loaded:', allModels.length);
 
-          const pluginModels = buildPluginModels(activePlugins);
-          allModels.push(...pluginModels);
-          logger.debug('Plugin models added:', pluginModels.length);
-        }
-      } catch (pluginError) {
-        logger.error('❌ Failed to load plugin models:', pluginError);
-        if (pluginError instanceof Error) {
-          logger.error('❌ Plugin error details:', {
-            message: pluginError.message,
-            response: (
-              pluginError as { response?: { data: unknown; status: number } }
-            ).response?.data,
-            status: (
-              pluginError as { response?: { data: unknown; status: number } }
-            ).response?.status,
-            url: (pluginError as { config?: { url: string } }).config?.url,
-          });
-        }
-        // Continue without plugin models
-      }
-
-      // Installed agent CLIs (admin-only; the endpoint returns [] otherwise)
-      try {
-        const { agentCliApi } = await import('@/utils/api');
-        const agentResponse = await agentCliApi.getModels();
-        if (agentResponse.success && agentResponse.data) {
-          const agentModels: OllamaModel[] = agentResponse.data.map(agent => ({
-            name: agent.id,
-            model: agent.id,
-            size: 0,
-            digest: '',
-            modified_at: '',
-            details: {},
-            isAgent: true,
-            agentName: agent.name,
-            agentId: agent.agentId,
-          }));
-          allModels.push(...agentModels);
-          logger.debug('Agent CLI models added:', agentModels.length);
-        }
-      } catch (agentError) {
-        logger.warn('Agent CLI models unavailable:', agentError);
-      }
-
-      const providerModelCount = allModels.length;
-
-      // Load personas and add them as special models
-      try {
-        const { personaApi } = await import('@/utils/api');
-        const personasResponse = await personaApi.getPersonas();
-        if (personasResponse.success && personasResponse.data) {
-          const personasMap = buildPersonasById(personasResponse.data);
-          const personaModels = buildPersonaModels(personasResponse.data);
-
-          allModels.push(...personaModels);
-
-          set(state => ({ ...state, personas: personasMap }));
-        }
-      } catch (personaError) {
-        logger.error('❌ Failed to load personas:', personaError);
-        // Continue without personas
-      }
-
-      logger.debug('Total models loaded:', allModels.length);
-      const providerLoadError =
-        providerModelCount === 0 && ollamaLoadError
-          ? getErrorMessage(ollamaLoadError, 'No model provider is available')
-          : null;
-
-      // Validate that the currently selected model still exists in the models list
+      // Validate currently selected model
       const currentState = get();
       const currentSelectedModel = currentState.selectedModel;
-      const currentSelection = {
-        model: currentSelectedModel,
-        providerType: currentState.selectedProviderType,
-        providerId: currentState.selectedProviderId,
-      };
-      const modelExists = Boolean(
-        findChatModelForSelection(allModels, currentSelection)
-      );
-      const hasExplicitProvider =
-        currentState.selectedProviderType === 'ollama' ||
-        currentState.selectedProviderType === 'plugin';
-
-      if (currentSelectedModel && !modelExists && hasExplicitProvider) {
-        const providerLabel =
-          currentState.selectedProviderType === 'plugin'
-            ? currentState.selectedProviderId || 'plugin'
-            : 'Ollama';
-        const unavailableError = `Selected model "${currentSelectedModel}" is unavailable from ${providerLabel}. Reactivate that provider or select another model.`;
-        set({
-          models: allModels,
-          loading: false,
-          error: unavailableError,
-        });
-        toast.error(unavailableError);
-        return;
-      }
+      const modelExists = allModels.some(m => m.model === currentSelectedModel);
 
       if (currentSelectedModel && !modelExists && allModels.length > 0) {
-        // Current model is no longer available, fallback to first available model
         const fallbackSelection = chatModelSelectionFromModel(allModels[0]);
-        logger.debug(
-          `⚠️ Legacy selected model "${currentSelectedModel}" no longer available, falling back to "${fallbackSelection.model}"`
-        );
         set({
           models: allModels,
           loading: false,
           selectedModel: fallbackSelection.model,
           selectedProviderType: fallbackSelection.providerType || null,
           selectedProviderId: fallbackSelection.providerId || null,
-          error: providerLoadError,
         });
-        preferencesApi
-          .setDefaultModel(
-            fallbackSelection.model,
-            fallbackSelection.providerType,
-            fallbackSelection.providerId
-          )
-          .catch(error => {
-            logger.warn('Failed to save fallback default model:', error);
-          });
-        toast.success(
-          `Switched to ${fallbackSelection.model} (previous model no longer available)`
-        );
       } else {
-        set({ models: allModels, loading: false, error: providerLoadError });
-      }
-      if (providerLoadError) {
-        toast.error(providerLoadError);
+        set({ models: allModels, loading: false });
       }
     } catch (error: unknown) {
-      logger.error('Error loading models:', error);
       const errorMessage = getErrorMessage(error, 'Failed to load models');
       set({ error: errorMessage, loading: false });
-      toast.error(errorMessage);
+      logger.error('Failed to load models:', error);
     }
   },
 
@@ -889,7 +748,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     try {
-      const response = await chatApi.updateSession(state.currentSession.id, {
+      const response = await directApi.updateSession(state.currentSession.id, {
         model,
         providerType,
         providerId:
@@ -926,25 +785,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // Personas
   personas: {},
   loadPersonas: async () => {
-    try {
-      set({ loading: true, error: null });
-      const response = await personaApi.getPersonas();
-
-      if (response.success && response.data) {
-        const personas = response.data;
-
-        set({
-          personas: buildPersonasById(personas),
-          loading: false,
-        });
-
-        logger.debug('✅ Personas loaded:', personas.length);
-      }
-    } catch (error: unknown) {
-      const errorMessage = getErrorMessage(error, 'Failed to load personas');
-      set({ error: errorMessage, loading: false });
-      logger.error('❌ Failed to load personas:', errorMessage);
-    }
+    // No personas in no-backend mode
+    set({ personas: {} });
   },
 
   getCurrentPersona: () => {
@@ -1014,19 +856,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           };
         });
 
-        // Also update the system message on the backend
-        const systemMessage = state.currentSession.messages[systemMessageIndex];
-        chatApi
-          .updateMessage(state.currentSession.id, systemMessage.id, {
-            content: message,
-          })
-          .catch(_error => {
-            logger.warn(
-              'Failed to sync system message update to backend:',
-              _error
-            );
-          });
-
+        // Also update the system message (no backend in this mode)
         logger.debug('✅ Updated system message in current session');
       }
     }
@@ -1042,20 +872,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setGeneratingTitleForSession: sessionId =>
     set({ generatingTitleForSession: sessionId }),
 
-  // Add a global test function for debugging
-  ...(typeof window !== 'undefined' && {
-    testPluginApi: async () => {
-      try {
-        logger.debug('🧪 Testing plugin API...');
-        const result = await pluginApi.getAllPlugins();
-        logger.debug('✅ Plugin API test result:', result);
-        return result;
-      } catch (error) {
-        logger.error('❌ Plugin API test failed:', error);
-        return { error };
-      }
-    },
-  }),
 }));
 
 // Export a function to clear state (for use by auth store)

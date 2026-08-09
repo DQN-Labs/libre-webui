@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import React, { useState, Suspense } from 'react';
+import React, { useState, Suspense, useEffect } from 'react';
 import {
   createBrowserRouter,
   createHashRouter,
@@ -46,10 +46,8 @@ import { Toaster } from 'react-hot-toast';
 import { Sidebar } from '@/components/Sidebar';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { API_BASE_URL } from '@/utils/config';
 import { WhatsNewModal } from '@/components/WhatsNewModal';
 import { useWhatsNew } from '@/hooks/useWhatsNew';
-import { DemoModeBanner } from '@/components/DemoModeBanner';
 import { BackgroundRenderer } from '@/components/BackgroundRenderer';
 import { AppTabBar } from '@/components/AppTabBar';
 import { startNewChat, startNewWork } from '@/utils/appNavigation';
@@ -58,14 +56,13 @@ import { LogoMark } from '@/components/LogoMark';
 import { useAppStore } from '@/store/appStore';
 import { useAuthStore } from '@/store/authStore';
 import { useInitializeApp } from '@/hooks/useInitializeApp';
-import { UserService } from '@/services/userService';
+import { directApi } from '@/utils/api/directApi';
 import {
   useKeyboardShortcuts,
   KeyboardShortcut,
 } from '@/hooks/useKeyboardShortcuts';
 import { cn } from '@/utils';
 import { createLogger } from '@/utils/logger';
-import websocketService from '@/utils/websocket';
 import toast from 'react-hot-toast';
 
 const logger = createLogger('app');
@@ -95,9 +92,9 @@ const ArtifactSlideOutPanel = React.lazy(() =>
     default: module.ArtifactSlideOutPanel,
   }))
 );
-const FirstTimeSetup = React.lazy(() =>
-  import('@/components/FirstTimeSetup').then(module => ({
-    default: module.FirstTimeSetup,
+const ProviderSettings = React.lazy(() =>
+  import('@/components/ProviderSettings').then(module => ({
+    default: module.ProviderSettings,
   }))
 );
 
@@ -176,7 +173,6 @@ const ShellLayout: React.FC<ShellLayoutProps> = ({
         hasBackground ? 'bg-white/10 dark:bg-dark-50/10' : 'bg-transparent'
       )}
     >
-      {showDemoBanner && <DemoModeBanner message={demoMessage} />}
       <AppTabBar />
       <main
         className={cn(
@@ -199,10 +195,10 @@ const AppContent: React.FC = () => {
   const navigate = useNavigate();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // Which settings tab to open on; the shortcuts key jumps straight to its own.
   const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined);
-  const [retryCount, setRetryCount] = useState(0);
-  const [setupComplete, setSetupComplete] = useState(false);
+  const [hasProviders, setHasProviders] = useState(() => {
+    return directApi.getProviders().length > 0;
+  });
   const {
     sidebarOpen,
     sidebarCompact,
@@ -214,80 +210,20 @@ const AppContent: React.FC = () => {
     backgroundImage,
     preferences,
     artifactPanelOpen,
-    closeArtifactPanel,
   } = useAppStore();
   const {
-    systemInfo,
-    isLoading: authLoading,
-    user: _user,
     isAuthenticated,
   } = useAuthStore();
-  const { isDemoMode, demoConfig } = useAppStore();
-  const hasWorkspaceAccess =
-    systemInfo?.requiresAuth === false || isAuthenticated;
+  const hasWorkspaceAccess = true;
   const whatsNew = useWhatsNew();
 
-  // Handle OAuth callback FIRST - before any routing or initialization
-  const [oauthProcessed, setOauthProcessed] = React.useState(false);
-  const processingRef = React.useRef(false);
-
-  React.useEffect(() => {
-    const processOAuthCallback = async () => {
-      // Prevent multiple simultaneous executions
-      if (processingRef.current) {
-        logger.debug('OAuth already processing, skipping...');
-        return;
-      }
-
-      logger.debug('Starting OAuth callback processing...');
-      processingRef.current = true;
-
-      const urlParams = new URLSearchParams(window.location.search);
-      const authStatus = urlParams.get('auth');
-
-      if (authStatus === 'success') {
-        try {
-          const response = await fetch(`${API_BASE_URL}/auth/oauth/exchange`, {
-            method: 'POST',
-            credentials: 'include',
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            if (data.success && data.data) {
-              const { login } = useAuthStore.getState();
-              login(data.data.user, data.data.token, data.data.systemInfo);
-              logger.debug('OAuth login successful');
-              toast.success('OAuth login successful!');
-            } else {
-              toast.error('Failed to complete OAuth authentication');
-            }
-          } else {
-            toast.error('OAuth authentication verification failed');
-          }
-        } catch (error) {
-          logger.error('OAuth processing error:', error);
-          toast.error('OAuth authentication failed');
-        }
-
-        // Clean up URL regardless of success/failure
-        window.history.replaceState(
-          {},
-          document.title,
-          window.location.pathname
-        );
-      }
-
-      logger.debug('OAuth processing completed');
-      setOauthProcessed(true);
-      processingRef.current = false;
-    };
-
-    processOAuthCallback();
-  }, []);
-
-  // Initialize the app only after OAuth is processed
+  // Initialize the app
   useInitializeApp();
+
+  // Check providers on mount
+  useEffect(() => {
+    setHasProviders(directApi.getProviders().length > 0);
+  }, []);
 
   // Check if any background is active (persona background or general background settings)
   const hasActiveBackground = () => {
@@ -379,270 +315,39 @@ const AppContent: React.FC = () => {
   // Enable keyboard shortcuts
   useKeyboardShortcuts(shortcuts, hasWorkspaceAccess);
 
-  // Global overlays live outside ProtectedRoute, so they must be closed and
-  // hidden explicitly whenever the authenticated workspace becomes
-  // unavailable (logout, expiry, or an unauthenticated /login visit).
-  React.useEffect(() => {
-    if (hasWorkspaceAccess) return;
-
-    const frame = window.requestAnimationFrame(() => {
-      setSettingsOpen(false);
-      closeArtifactPanel();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [closeArtifactPanel, hasWorkspaceAccess]);
-
-  // Initialize WebSocket connection
-  React.useEffect(() => {
-    if (!hasWorkspaceAccess) {
-      websocketService.disconnect();
-      return;
-    }
-
-    websocketService.connect().catch(logger.error);
-
-    return () => {
-      websocketService.disconnect();
-    };
-  }, [hasWorkspaceAccess]);
-
-  // Auto-retry connection to backend when it's not available
-  React.useEffect(() => {
-    if (!systemInfo && !authLoading && retryCount < 15) {
-      const timer = setTimeout(async () => {
-        setRetryCount(c => c + 1);
-        try {
-          // Re-run auth initialization to check if backend is now available
-          await UserService.initializeAuth();
-        } catch {
-          // Will retry on next interval
-        }
-      }, 2000);
-      return () => clearTimeout(timer);
-    }
-  }, [systemInfo, authLoading, retryCount]);
-
-  // Enter first-time setup mode when conditions are met (derived from auth/system state)
-  const inFirstTimeSetup =
-    !setupComplete &&
-    systemInfo?.requiresAuth === true &&
-    systemInfo?.hasUsers === false;
-
-  // Show loading spinner while initializing auth
-  if (authLoading) {
+  // Show provider setup if no providers configured
+  if (!hasProviders) {
     return (
-      <div className='min-h-screen bg-gray-50 dark:bg-dark-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8'>
-        <div className='sm:mx-auto sm:w-full sm:max-w-md'>
-          <div className='flex flex-col items-center'>
-            <LogoMark size='lg' className='text-gray-900 dark:text-gray-100' />
-          </div>
-        </div>
-
-        <div className='mt-8 flex flex-col items-center gap-4'>
-          <div className='w-8 h-8 border-4 border-gray-300 dark:border-gray-600 border-t-primary-500 dark:border-t-primary-400 rounded-full animate-spin'></div>
-        </div>
-      </div>
-    );
-  }
-
-  // Show loading screen while waiting for backend
-  if (!systemInfo) {
-    return (
-      <div className='min-h-screen bg-gray-50 dark:bg-dark-50 flex items-center justify-center p-4'>
-        <div className='text-center'>
-          <div className='mb-8'>
-            <LogoMark
-              size='lg'
-              className='mx-auto text-gray-900 dark:text-white'
-            />
-          </div>
-          <div className='flex justify-center mb-4'>
-            <div className='w-8 h-8 border-4 border-gray-300 dark:border-dark-300 border-t-primary-500 dark:border-t-primary-400 rounded-full animate-spin'></div>
-          </div>
-          <p className='text-gray-600 dark:text-dark-600 text-sm'>
-            {retryCount > 0
-              ? `Connecting to backend... (${retryCount}/15)`
-              : 'Starting up...'}
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // Show FirstTimeSetup if we're in setup mode and haven't completed it
-  if (inFirstTimeSetup && !setupComplete) {
-    return (
-      <ErrorBoundary>
-        <Suspense fallback={<PageLoader />}>
-          <FirstTimeSetup
-            onComplete={() => {
-              setSetupComplete(true);
-            }}
-          />
-        </Suspense>
-      </ErrorBoundary>
-    );
-  }
-
-  // Show loading state while processing OAuth
-  if (!oauthProcessed) {
-    return (
-      <div className='min-h-screen bg-gray-50 dark:bg-dark-50 flex items-center justify-center'>
-        <div className='w-8 h-8 border-4 border-gray-300 dark:border-gray-600 border-t-primary-500 dark:border-t-primary-400 rounded-full animate-spin'></div>
-      </div>
+      <Suspense fallback={<PageLoader />}>
+        <ProviderSettings onComplete={() => setHasProviders(true)} />
+      </Suspense>
     );
   }
 
   return (
     <>
-      {/* Show full layout only if system doesn't require auth or user is authenticated */}
-      {systemInfo && !systemInfo.requiresAuth ? (
-        // No auth required - show full layout
-        <ShellLayout
-          hasBackground={!!hasActiveBackground()}
-          sidebarOpen={sidebarOpen}
-          sidebarCompact={sidebarCompact}
-          onCloseSidebar={() => setSidebarOpen(false)}
-          showDemoBanner={isDemoMode && demoConfig.showBanner}
-          demoMessage={demoConfig.message}
-        >
-          <Routes>
-            <Route path='/' element={<HomePage />} />
-            <Route path='/chat' element={<ChatPage />} />
-            <Route path='/c/:sessionId' element={<ChatPage />} />
-            <Route path='/models' element={<ModelsPage />} />
-            <Route path='/personas' element={<PersonasPage />} />
-            <Route path='/gallery' element={<GalleryPage />} />
-            <Route path='/notes' element={<NotesPage />} />
-            <Route
-              path='/work'
-              element={
-                <ProtectedRoute requireWork={true}>
-                  <WorkPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path='/work/:taskId'
-              element={
-                <ProtectedRoute requireWork={true}>
-                  <WorkPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path='/agents'
-              element={
-                <ProtectedRoute requireAdmin={true} requireAgents={true}>
-                  <LibreClawPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path='/usage'
-              element={
-                <ProtectedRoute requireAdmin={true}>
-                  <PluginUsagePage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path='/system'
-              element={
-                <ProtectedRoute requireAdmin={true}>
-                  <SystemPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route path='/login' element={<LoginPage />} />
-          </Routes>
-        </ShellLayout>
-      ) : (
-        // Auth required - show routes without main layout constraining login
+      {/* Full layout - no auth required */}
+      <ShellLayout
+        hasBackground={!!hasActiveBackground()}
+        sidebarOpen={sidebarOpen}
+        sidebarCompact={sidebarCompact}
+        onCloseSidebar={() => setSidebarOpen(false)}
+        showDemoBanner={false}
+      >
         <Routes>
-          <Route path='/login' element={<LoginPage />} />
-          <Route
-            path='/*'
-            element={
-              <ProtectedRoute>
-                <ShellLayout
-                  hasBackground={!!hasActiveBackground()}
-                  sidebarOpen={sidebarOpen}
-                  sidebarCompact={sidebarCompact}
-                  onCloseSidebar={() => setSidebarOpen(false)}
-                  showDemoBanner={isDemoMode && demoConfig.showBanner}
-                  demoMessage={demoConfig.message}
-                >
-                  <Routes>
-                    <Route path='/' element={<HomePage />} />
-                    <Route path='/chat' element={<ChatPage />} />
-                    <Route path='/c/:sessionId' element={<ChatPage />} />
-                    <Route path='/models' element={<ModelsPage />} />
-                    <Route path='/personas' element={<PersonasPage />} />
-                    <Route path='/gallery' element={<GalleryPage />} />
-                    <Route path='/notes' element={<NotesPage />} />
-                    <Route
-                      path='/work'
-                      element={
-                        <ProtectedRoute requireWork={true}>
-                          <WorkPage />
-                        </ProtectedRoute>
-                      }
-                    />
-                    <Route
-                      path='/work/:taskId'
-                      element={
-                        <ProtectedRoute requireWork={true}>
-                          <WorkPage />
-                        </ProtectedRoute>
-                      }
-                    />
-                    <Route
-                      path='/agents'
-                      element={
-                        <ProtectedRoute
-                          requireAdmin={true}
-                          requireAgents={true}
-                        >
-                          <LibreClawPage />
-                        </ProtectedRoute>
-                      }
-                    />
-                    <Route path='/artifacts' element={<ArtifactDemoPage />} />
-                    <Route
-                      path='/usage'
-                      element={
-                        <ProtectedRoute requireAdmin={true}>
-                          <PluginUsagePage />
-                        </ProtectedRoute>
-                      }
-                    />
-                    <Route
-                      path='/system'
-                      element={
-                        <ProtectedRoute requireAdmin={true}>
-                          <SystemPage />
-                        </ProtectedRoute>
-                      }
-                    />
-                    <Route
-                      path='/users'
-                      element={
-                        <ProtectedRoute requireAdmin={true}>
-                          <UserManagementPage />
-                        </ProtectedRoute>
-                      }
-                    />
-                  </Routes>
-                </ShellLayout>
-              </ProtectedRoute>
-            }
-          />
+          <Route path='/' element={<HomePage />} />
+          <Route path='/chat' element={<ChatPage />} />
+          <Route path='/c/:sessionId' element={<ChatPage />} />
+          <Route path='/models' element={<ModelsPage />} />
+          <Route path='/personas' element={<PersonasPage />} />
+          <Route path='/gallery' element={<GalleryPage />} />
+          <Route path='/notes' element={<NotesPage />} />
+          <Route path='/artifacts' element={<ArtifactDemoPage />} />
         </Routes>
-      )}
+      </ShellLayout>
 
       {/* Modals */}
-      {hasWorkspaceAccess && settingsOpen && (
+      {settingsOpen && (
         <Suspense fallback={null}>
           <SettingsModal
             isOpen={settingsOpen}
